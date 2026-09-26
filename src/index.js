@@ -105,6 +105,11 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
   }
 
   const defaultTtlMs = ttlMs;
+  // resource -> FIFO array of waiter records; waitId -> waiter (pending only).
+  // Waiters live in memory only: queueing, timing out and cancelling are not
+  // logged, only the eventual grant is.
+  const waitQueues = new Map();
+  const pendingWaiters = new Map();
   // token -> { resource, holder, expiresAt, ttlMs, legacy, heapSeq }
   const leases = new Map();
   // Every token this instance knows about, including replayed credentials
@@ -128,13 +133,14 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
   const registryId = registrySequence;
   let tokenSequence = 0;
   let queueOrder = 0;
+  let waitSequence = 0;
 
-  function mintToken(now) {
+  function mintToken(now, seq = tokenSequence) {
     // Pure candidate: nothing is committed until the event is on disk, so a
     // failed append rolls all the way back. Pids and instance ids can coincide
     // after a restart, so skip any sequence that collides with a credential
-    // reconstructed from the log.
-    let seq = tokenSequence;
+    // reconstructed from the log. The caller threads the sequence through when
+    // it mints several tokens for one atomic write.
     let token;
     do {
       seq += 1;
@@ -156,12 +162,18 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     return lease !== undefined && lease.expiresAt > now;
   }
 
-  function appendEvent(event) {
+  function appendEvents(events) {
     if (logPath === null) {
       return;
     }
+    // One write for the whole batch: an operation that frees a resource and
+    // wakes a waiter either lands completely or not at all.
+    let text = '';
+    for (const event of events) {
+      text += `${JSON.stringify(event)}\n`;
+    }
     try {
-      fs.appendFileSync(logPath, `${JSON.stringify(event)}\n`);
+      fs.appendFileSync(logPath, text);
     } catch (cause) {
       throw new LogFileError(
         `failed to append to lease log at ${logPath}`,
@@ -170,19 +182,144 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     }
   }
 
-  function acquire(resource, holder, ttlMs = defaultTtlMs) {
+  function appendEvent(event) {
+    appendEvents([event]);
+  }
+
+  // A queued request gives up once the clock reaches its deadline and is
+  // never woken afterwards. Dropping it moves no counter and no ownership.
+  function purgeExpiredWaiters(now) {
+    for (const [resource, queue] of waitQueues) {
+      for (let i = queue.length - 1; i >= 0; i -= 1) {
+        const waiter = queue[i];
+        if (waiter.deadline <= now) {
+          queue.splice(i, 1);
+          pendingWaiters.delete(waiter.waitId);
+          waiter.ticket.status = 'expired';
+        }
+      }
+      if (queue.length === 0) {
+        waitQueues.delete(resource);
+      }
+    }
+  }
+
+  function enqueueWaiter(resource, holder, ttlMs, now, waitMs) {
+    waitSequence += 1;
+    const waitId = `wait-${registryId}-${waitSequence}`;
+    // The ticket is the caller's handle: it starts as a waiting result and is
+    // updated in place when the request is granted, expires or is cancelled.
+    const ticket = { status: 'waiting', resource, holder, waitId };
+    const waiter = {
+      waitId,
+      resource,
+      holder,
+      ttlMs,
+      deadline: now + waitMs,
+      ticket,
+    };
+    let queue = waitQueues.get(resource);
+    if (queue === undefined) {
+      queue = [];
+      waitQueues.set(resource, queue);
+    }
+    queue.push(waiter);
+    pendingWaiters.set(waitId, waiter);
+    return ticket;
+  }
+
+  // Plan the grant to the head of the resource's queue without touching any
+  // state; the caller commits only after the events are safely on disk.
+  function planWakeup(resource, now, seq) {
+    const queue = waitQueues.get(resource);
+    if (queue === undefined || queue.length === 0) {
+      return null;
+    }
+    const waiter = queue[0];
+    const minted = mintToken(now, seq);
+    const expiresAt = now + waiter.ttlMs;
+    return {
+      waiter,
+      token: minted.token,
+      seq: minted.seq,
+      expiresAt,
+      event: {
+        v: LOG_VERSION,
+        type: 'acquire',
+        at: now,
+        token: minted.token,
+        resource,
+        holder: waiter.holder,
+        ttlMs: waiter.ttlMs,
+        expiresAt,
+        waitId: waiter.waitId,
+      },
+    };
+  }
+
+  function applyWakeup(wake) {
+    const { waiter } = wake;
+    tokenSequence = wake.seq;
+    knownTokens.add(wake.token);
+    const lease = {
+      resource: waiter.resource,
+      holder: waiter.holder,
+      expiresAt: wake.expiresAt,
+      ttlMs: waiter.ttlMs,
+      legacy: false,
+      heapSeq: 0,
+    };
+    leases.set(wake.token, lease);
+    occupied.set(waiter.resource, wake.token);
+    enqueue(wake.token, lease);
+    counters.granted += 1;
+
+    const queue = waitQueues.get(waiter.resource);
+    queue.shift();
+    if (queue.length === 0) {
+      waitQueues.delete(waiter.resource);
+    }
+    pendingWaiters.delete(waiter.waitId);
+    waiter.ticket.status = 'granted';
+    waiter.ticket.token = wake.token;
+    waiter.ticket.expiresAt = wake.expiresAt;
+  }
+
+  function acquire(resource, holder, ttlMs = defaultTtlMs, waitMs = undefined) {
     if (!Number.isFinite(ttlMs) || ttlMs <= 0) {
       throw new TypeError('ttlMs must be a positive finite number');
     }
+    const wantsWait = waitMs !== undefined && waitMs !== null;
+    if (wantsWait && (!Number.isFinite(waitMs) || waitMs <= 0)) {
+      throw new TypeError('waitMs must be a positive finite number');
+    }
     const now = clock();
+    purgeExpiredWaiters(now);
     const currentToken = occupied.get(resource);
     if (currentToken !== undefined) {
       const current = leases.get(currentToken);
       if (isLive(current, now)) {
-        throw new LeaseTakenError(resource, current.holder);
+        if (!wantsWait) {
+          throw new LeaseTakenError(resource, current.holder);
+        }
+        // Occupied: take a place in line instead of throwing. The resource
+        // does not change hands just because a waiter showed up.
+        return enqueueWaiter(resource, holder, ttlMs, now, waitMs);
       }
       // Expired but not yet swept: the resource is free. The stale record is
       // dropped together with the new grant below (no event of its own).
+    }
+
+    if (waitQueues.has(resource)) {
+      // Queued waiters hold their place in line: a late acquire cannot take
+      // the resource they are waiting for, it can only join the queue.
+      if (!wantsWait) {
+        const stale = currentToken !== undefined
+          ? leases.get(currentToken)
+          : undefined;
+        throw new LeaseTakenError(resource, stale?.holder ?? null);
+      }
+      return enqueueWaiter(resource, holder, ttlMs, now, waitMs);
     }
 
     const { token, seq } = mintToken(now);
@@ -231,6 +368,7 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     if (lease.expiresAt <= now) {
       return false;
     }
+    purgeExpiredWaiters(now);
     const expiresAt = now + lease.ttlMs;
     appendEvent({ v: LOG_VERSION, type: 'renew', at: now, token, expiresAt });
 
@@ -250,7 +388,17 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     if (lease.expiresAt <= now) {
       return false;
     }
-    appendEvent({ v: LOG_VERSION, type: 'release', at: now, token });
+    purgeExpiredWaiters(now);
+
+    // A freed resource goes straight to the head of its queue. The wakeup
+    // grant is planned first and appended in the same write as the release,
+    // so a failed log leaves both the lease and the queue untouched.
+    const wake = planWakeup(lease.resource, now, tokenSequence);
+    const events = [{ v: LOG_VERSION, type: 'release', at: now, token }];
+    if (wake !== null) {
+      events.push(wake.event);
+    }
+    appendEvents(events);
 
     // The record comes off immediately; its queued node retires lazily.
     leases.delete(token);
@@ -258,10 +406,32 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
       occupied.delete(lease.resource);
     }
     counters.released += 1;
+    if (wake !== null) {
+      applyWakeup(wake);
+    }
+    return true;
+  }
+
+  // Cancelling only lands on a request that is still queued: an already
+  // woken, expired or cancelled request reports false, as does an unknown id.
+  function cancel(waitId) {
+    purgeExpiredWaiters(clock());
+    const waiter = pendingWaiters.get(waitId);
+    if (waiter === undefined) {
+      return false;
+    }
+    const queue = waitQueues.get(waiter.resource);
+    queue.splice(queue.indexOf(waiter), 1);
+    if (queue.length === 0) {
+      waitQueues.delete(waiter.resource);
+    }
+    pendingWaiters.delete(waiter.waitId);
+    waiter.ticket.status = 'cancelled';
     return true;
   }
 
   function sweep(now = clock()) {
+    purgeExpiredWaiters(now);
     const due = [];
     while (expiryQueue.size > 0) {
       const node = expiryQueue.peek();
@@ -281,16 +451,35 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
       return [];
     }
 
+    // Reclaimed resources are handed to the head of their queue in the same
+    // expiry order the reclaim happens; every wakeup grant rides along in the
+    // same log write, so a failed append rolls everything back together.
+    const events = [{
+      v: LOG_VERSION,
+      type: 'reclaim',
+      at: now,
+      items: due.map((node) => ({
+        token: node.token,
+        resource: leases.get(node.token).resource,
+      })),
+    }];
+    const wakes = [];
+    let seqCursor = tokenSequence;
+    for (const node of due) {
+      const lease = leases.get(node.token);
+      if (occupied.get(lease.resource) !== node.token) {
+        continue;
+      }
+      const wake = planWakeup(lease.resource, now, seqCursor);
+      if (wake !== null) {
+        seqCursor = wake.seq;
+        wakes.push(wake);
+        events.push(wake.event);
+      }
+    }
+
     try {
-      appendEvent({
-        v: LOG_VERSION,
-        type: 'reclaim',
-        at: now,
-        items: due.map((node) => ({
-          token: node.token,
-          resource: leases.get(node.token).resource,
-        })),
-      });
+      appendEvents(events);
     } catch (error) {
       // The write never happened: put the popped nodes back so the queue is
       // byte-for-byte the same as before the call.
@@ -310,16 +499,21 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
         freed.push(lease.resource);
       }
     }
+    for (const wake of wakes) {
+      applyWakeup(wake);
+    }
     return freed;
   }
 
   function holder(resource) {
+    const now = clock();
+    purgeExpiredWaiters(now);
     const token = occupied.get(resource);
     if (token === undefined) {
       return null;
     }
     const lease = leases.get(token);
-    if (!isLive(lease, clock())) {
+    if (!isLive(lease, now)) {
       return null;
     }
     return lease.holder;
@@ -328,6 +522,7 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
   function stats() {
     let live = 0;
     const now = clock();
+    purgeExpiredWaiters(now);
     for (const token of occupied.values()) {
       const lease = leases.get(token);
       if (isLive(lease, now)) {
@@ -345,7 +540,7 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
 
   replay();
 
-  return { acquire, renew, release, sweep, holder, stats };
+  return { acquire, renew, release, sweep, holder, stats, cancel };
 
   function replay() {
     if (logPath === null) {

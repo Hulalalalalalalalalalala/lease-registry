@@ -26,6 +26,26 @@ Node.js 20 or newer. No runtime dependencies.
 - `LeaseTakenError` exported class carrying a `code` property.
 - `LogFileError` exported class carrying a `code` property (`'LOG_FILE_ERROR'`).
 
+### Wait queue
+
+`acquire` accepts an optional fourth argument, `waitMs`; omitting it keeps
+the behavior above exactly. When the resource is held and `waitMs` is given,
+the call queues instead of throwing and returns a waiting result
+`{ status: 'waiting', resource, holder, waitId }`; queueing itself moves no
+counter and writes no log line. Waiters for one resource are served in FIFO
+order: a lease freed by `release` or reclaimed by `sweep` goes straight to
+the head of that resource's queue, and the woken ticket then reads
+`{ status: 'granted', resource, holder, waitId, token, expiresAt }` with its
+own fresh expiry. A waiter whose budget runs out — judged by the injected
+clock — gives up: its ticket reads `status: 'expired'` and it is never
+woken. `Registry.cancel(waitId) -> boolean` drops a still queued request and
+reports `true`; already granted, expired, cancelled or unknown requests
+report `false`. Timed-out, cancelled and failed requests never increment
+`granted` and never change ownership, and a late acquire cannot jump ahead
+of a live queue. Only the eventual grant is written to the log (in the same
+write as the release or reclaim that triggered it), so queued requests do
+not survive a restart.
+
 When `logPath` points at a file, every grant, renewal, early release and
 reclaim is appended to it as one JSON line. On startup the history is replayed
 in order, so unexpired leases keep occupying their resources and the four
