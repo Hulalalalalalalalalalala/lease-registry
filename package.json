@@ -1,0 +1,10 @@
+{
+  "name": "lease-registry",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Time bounded lease registry with expiry reclamation",
+  "main": "src/index.js",
+  "scripts": { "test": "node --test" },
+  "engines": { "node": ">=20" }
+}
