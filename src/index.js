@@ -1,6 +1,10 @@
 // In-process, time bounded lease registry with append-only log persistence.
 // Time only moves when the injected clock moves; nothing expires on its own.
 // Tokens are derived from the injected clock as well, never from wall time.
+//
+// Beyond single resources, one call can atomically acquire several resources:
+// every listed occurrence gets its own credential, and either the whole
+// request holds everything or it queues everywhere holding nothing.
 
 import fs from 'node:fs';
 
@@ -105,19 +109,21 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
   }
 
   const defaultTtlMs = ttlMs;
-  // resource -> FIFO array of waiter records; waitId -> waiter (pending only).
-  // Waiters live in memory only: queueing, timing out and cancelling are not
-  // logged, only the eventual grant is.
+  // resource -> FIFO array of queue positions. A group request listing the
+  // same resource twice occupies two positions in that queue.
   const waitQueues = new Map();
-  const pendingWaiters = new Map();
-  // token -> { resource, holder, expiresAt, ttlMs, legacy, heapSeq }
+  // requestId -> group request, while the request is still queued.
+  const pendingGroups = new Map();
+  // token -> { resource, holder, expiresAt, ttlMs, legacy, heapSeq, batch }
   const leases = new Map();
   // Every token this instance knows about, including replayed credentials
   // that were already released or reclaimed, so a freshly minted token can
   // never reuse a dead credential's string.
   const knownTokens = new Set();
-  // resource -> token of the lease currently occupying it
-  const occupied = new Map();
+  // resource -> tokens currently occupying it. Usually one entry; an atomic
+  // group listing one resource several times holds one credential per
+  // occurrence.
+  const slots = new Map();
   const expiryQueue = new ExpiryQueue();
 
   const counters = {
@@ -133,7 +139,8 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
   const registryId = registrySequence;
   let tokenSequence = 0;
   let queueOrder = 0;
-  let waitSequence = 0;
+  let requestSequence = 0;
+  let batchSequence = 0;
 
   function mintToken(now, seq = tokenSequence) {
     // Pure candidate: nothing is committed until the event is on disk, so a
@@ -162,12 +169,85 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     return lease !== undefined && lease.expiresAt > now;
   }
 
+  function addSlot(resource, token) {
+    let list = slots.get(resource);
+    if (list === undefined) {
+      list = [];
+      slots.set(resource, list);
+    }
+    list.push(token);
+  }
+
+  function removeSlot(resource, token) {
+    const list = slots.get(resource);
+    if (list === undefined) {
+      return false;
+    }
+    const index = list.indexOf(token);
+    if (index === -1) {
+      return false;
+    }
+    list.splice(index, 1);
+    if (list.length === 0) {
+      slots.delete(resource);
+    }
+    return true;
+  }
+
+  // Drop expired-but-unswept credentials from a resource that is about to be
+  // granted: the resource is free, and a retaken lease must never be reported
+  // as reclaimed later. Mirrors the single-resource retake rule.
+  function dropStaleSlots(resource, now) {
+    const list = slots.get(resource);
+    if (list === undefined) {
+      return;
+    }
+    for (let i = list.length - 1; i >= 0; i -= 1) {
+      const token = list[i];
+      if (!isLive(leases.get(token), now)) {
+        leases.delete(token);
+        list.splice(i, 1);
+      }
+    }
+    if (list.length === 0) {
+      slots.delete(resource);
+    }
+  }
+
+  function liveSlotCount(resource, now) {
+    const list = slots.get(resource);
+    if (list === undefined) {
+      return 0;
+    }
+    let live = 0;
+    for (const token of list) {
+      if (isLive(leases.get(token), now)) {
+        live += 1;
+      }
+    }
+    return live;
+  }
+
+  function liveHolder(resource, now) {
+    const list = slots.get(resource);
+    if (list === undefined) {
+      return null;
+    }
+    for (const token of list) {
+      const lease = leases.get(token);
+      if (isLive(lease, now)) {
+        return lease.holder;
+      }
+    }
+    return null;
+  }
+
   function appendEvents(events) {
     if (logPath === null) {
       return;
     }
-    // One write for the whole batch: an operation that frees a resource and
-    // wakes a waiter either lands completely or not at all.
+    // One write for the whole batch: an operation that frees resources and
+    // wakes requests either lands completely or not at all.
     let text = '';
     for (const event of events) {
       text += `${JSON.stringify(event)}\n`;
@@ -186,177 +266,417 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     appendEvents([event]);
   }
 
+  function detachGroup(group) {
+    for (const position of group.positions) {
+      const queue = waitQueues.get(position.resource);
+      if (queue === undefined) {
+        continue;
+      }
+      const index = queue.indexOf(position);
+      if (index !== -1) {
+        queue.splice(index, 1);
+        if (queue.length === 0) {
+          waitQueues.delete(position.resource);
+        }
+      }
+    }
+    pendingGroups.delete(group.requestId);
+  }
+
   // A queued request gives up once the clock reaches its deadline and is
   // never woken afterwards. Dropping it moves no counter and no ownership.
   function purgeExpiredWaiters(now) {
-    for (const [resource, queue] of waitQueues) {
-      for (let i = queue.length - 1; i >= 0; i -= 1) {
-        const waiter = queue[i];
-        if (waiter.deadline <= now) {
-          queue.splice(i, 1);
-          pendingWaiters.delete(waiter.waitId);
-          waiter.ticket.status = 'expired';
-        }
+    const dead = [];
+    for (const group of pendingGroups.values()) {
+      if (group.deadline <= now) {
+        dead.push(group);
       }
-      if (queue.length === 0) {
-        waitQueues.delete(resource);
-      }
+    }
+    for (const group of dead) {
+      detachGroup(group);
+      group.ticket.status = 'expired';
     }
   }
 
-  function enqueueWaiter(resource, holder, ttlMs, now, waitMs) {
-    waitSequence += 1;
-    const waitId = `wait-${registryId}-${waitSequence}`;
+  function enqueueGroup(resources, ttlList, holder, now, waitMs, single) {
+    requestSequence += 1;
+    const requestId = `wait-${registryId}-${requestSequence}`;
     // The ticket is the caller's handle: it starts as a waiting result and is
     // updated in place when the request is granted, expires or is cancelled.
-    const ticket = { status: 'waiting', resource, holder, waitId };
-    const waiter = {
-      waitId,
-      resource,
+    // Single-resource callers keep the exact baseline ticket shape.
+    const ticket = single
+      ? { status: 'waiting', resource: resources[0], holder, waitId: requestId }
+      : { status: 'waiting', resources: [...resources], holder, waitId: requestId, requestId };
+    const group = {
+      requestId,
+      arrival: requestSequence,
       holder,
-      ttlMs,
       deadline: now + waitMs,
+      single,
       ticket,
+      positions: [],
     };
-    let queue = waitQueues.get(resource);
-    if (queue === undefined) {
-      queue = [];
-      waitQueues.set(resource, queue);
-    }
-    queue.push(waiter);
-    pendingWaiters.set(waitId, waiter);
-    return ticket;
+    // One position per listed occurrence, pushed onto each resource's queue
+    // in the given order, so a repeated resource lines up as many times as it
+    // was listed.
+    resources.forEach((resource, index) => {
+      const position = {
+        group,
+        resource,
+        ttlMs: ttlList[index],
+        granted: false,
+        token: null,
+        expiresAt: null,
+      };
+      group.positions.push(position);
+      let queue = waitQueues.get(resource);
+      if (queue === undefined) {
+        queue = [];
+        waitQueues.set(resource, queue);
+      }
+      queue.push(position);
+    });
+    pendingGroups.set(requestId, group);
+    return group;
   }
 
-  // Plan the grant to the head of the resource's queue without touching any
-  // state; the caller commits only after the events are safely on disk.
-  function planWakeup(resource, now, seq) {
-    const queue = waitQueues.get(resource);
-    if (queue === undefined || queue.length === 0) {
-      return null;
+  function nextBatchId() {
+    batchSequence += 1;
+    return `batch-${registryId}-${batchSequence}`;
+  }
+
+  // Plan every grant one request needs (one per still-ungranted position),
+  // touching no state. The caller commits only after all events are on disk.
+  // batchId ties the credentials of one atomic batch together for replay.
+  function planGroupGrants(group, now, seqCursor, batchId) {
+    const grants = [];
+    let seq = seqCursor;
+    for (const position of group.positions) {
+      if (position.granted) {
+        continue;
+      }
+      const minted = mintToken(now, seq);
+      seq = minted.seq;
+      const expiresAt = now + position.ttlMs;
+      grants.push({
+        position,
+        group,
+        resource: position.resource,
+        holder: group.holder,
+        ttlMs: position.ttlMs,
+        token: minted.token,
+        seq: minted.seq,
+        expiresAt,
+        event: {
+          v: LOG_VERSION,
+          type: 'acquire',
+          at: now,
+          token: minted.token,
+          resource: position.resource,
+          holder: group.holder,
+          ttlMs: position.ttlMs,
+          expiresAt,
+          requestId: group.requestId,
+          batch: batchId,
+        },
+      });
     }
-    const waiter = queue[0];
-    const minted = mintToken(now, seq);
-    const expiresAt = now + waiter.ttlMs;
-    return {
-      waiter,
-      token: minted.token,
-      seq: minted.seq,
-      expiresAt,
-      event: {
+    return { group, grants, seq, batchId };
+  }
+
+  function applyPlannedGrants(plan, now) {
+    const { group, batchId } = plan;
+    for (const grant of plan.grants) {
+      tokenSequence = grant.seq;
+      knownTokens.add(grant.token);
+      const lease = {
+        resource: grant.resource,
+        holder: grant.holder,
+        expiresAt: grant.expiresAt,
+        ttlMs: grant.ttlMs,
+        legacy: false,
+        heapSeq: 0,
+        batch: batchId,
+      };
+      leases.set(grant.token, lease);
+      dropStaleSlots(grant.resource, now);
+      addSlot(grant.resource, grant.token);
+      enqueue(grant.token, lease);
+      counters.granted += 1;
+
+      grant.position.token = grant.token;
+      grant.position.expiresAt = grant.expiresAt;
+      grant.position.granted = true;
+    }
+
+    // The batch holds everything it asked for; it leaves every queue at once.
+    const { ticket } = group;
+    detachGroup(group);
+    ticket.status = 'granted';
+    const granted = group.positions.map((position) => ({
+      resource: position.resource,
+      holder: group.holder,
+      token: position.token,
+      expiresAt: position.expiresAt,
+    }));
+    if (group.single) {
+      ticket.token = granted[0].token;
+      ticket.expiresAt = granted[0].expiresAt;
+    } else {
+      // One credential per listed occurrence, each with its own expiry.
+      ticket.leases = granted;
+      ticket.results = granted;
+    }
+  }
+
+  function positionPlanned(plans, position) {
+    return plans.some((plan) =>
+      plan.grants.some((grant) => grant.position === position));
+  }
+
+  // A queued request is fillable exactly when every position reaches the
+  // front of its resource's queue and that resource is free once the
+  // triggering event is applied. Only live credentials occupy: an expired
+  // but unswept lease is already gone, while a surviving twin of a released
+  // duplicate credential keeps the resource held.
+  function groupFillable(group, plans, freedLiveCount, now) {
+    for (const position of group.positions) {
+      if (position.granted) {
+        continue;
+      }
+      const queue = waitQueues.get(position.resource);
+      if (queue === undefined) {
+        return false;
+      }
+      const index = queue.indexOf(position);
+      for (let i = 0; i < index; i += 1) {
+        const ahead = queue[i];
+        if (ahead.group === group) {
+          // Own repeated listing: its positions are granted together.
+          continue;
+        }
+        if (positionPlanned(plans, ahead)) {
+          // An earlier request woken by this same event leaves the queue as
+          // part of the same write.
+          continue;
+        }
+        return false;
+      }
+      // A release vacates a live credential; a sweep only removes leases
+      // that were already expired, so it frees no live occupancy here.
+      let occupied = Math.max(
+        0,
+        liveSlotCount(position.resource, now)
+          - (freedLiveCount.get(position.resource) ?? 0),
+      );
+      for (const plan of plans) {
+        if (plan.group === group) {
+          continue;
+        }
+        for (const grant of plan.grants) {
+          if (grant.resource === position.resource) {
+            occupied += 1;
+          }
+        }
+      }
+      if (occupied > 0) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // Grant every queued request whose resources become available through the
+  // given freeing event, cascading across resources and queues. Entries are
+  // { resource, live }: a release vacates a live credential, a reclaim only
+  // removes one that had already expired. Everything planned rides in the
+  // triggering log write.
+  function planWakeups(freedEntries, now) {
+    const freedLiveCount = new Map();
+    for (const entry of freedEntries) {
+      if (entry.live) {
+        freedLiveCount.set(
+          entry.resource,
+          (freedLiveCount.get(entry.resource) ?? 0) + 1,
+        );
+      }
+    }
+    const plans = [];
+    let seq = tokenSequence;
+    for (;;) {
+      // Candidates are picked strictly by arrival order: pendingGroups keeps
+      // insertion order, so the earliest fillable request wins and no
+      // resource's queue can jump ahead of an earlier request.
+      let next = null;
+      for (const group of pendingGroups.values()) {
+        if (plans.some((plan) => plan.group === group)) {
+          continue;
+        }
+        if (groupFillable(group, plans, freedLiveCount, now)) {
+          next = group;
+          break;
+        }
+      }
+      if (next === null) {
+        break;
+      }
+      const plan = planGroupGrants(next, now, seq, nextBatchId());
+      seq = plan.seq;
+      plans.push(plan);
+    }
+    return plans;
+  }
+
+  function validateWait(waitMs) {
+    const wantsWait = waitMs !== undefined && waitMs !== null;
+    if (wantsWait && (!Number.isFinite(waitMs) || waitMs <= 0)) {
+      throw new TypeError('waitMs must be a positive finite number');
+    }
+    return wantsWait;
+  }
+
+  // Resolve the ttl argument into one positive finite ttl per occurrence.
+  function resolveTtls(resources, ttlMs) {
+    if (ttlMs === undefined) {
+      return resources.map(() => defaultTtlMs);
+    }
+    if (Array.isArray(ttlMs)) {
+      if (ttlMs.length !== resources.length) {
+        throw new TypeError('ttlMs must match the resources list length');
+      }
+      return ttlMs.map((value) => {
+        if (!Number.isFinite(value) || value <= 0) {
+          throw new TypeError('ttlMs must be a positive finite number');
+        }
+        return value;
+      });
+    }
+    if (!Number.isFinite(ttlMs) || ttlMs <= 0) {
+      throw new TypeError('ttlMs must be a positive finite number');
+    }
+    return resources.map(() => ttlMs);
+  }
+
+  // Persist and commit one credential per listed occurrence, all in a single
+  // log write. A failed write leaves every resource exactly as before.
+  function commitDirectGrants(resources, ttlList, holder, now) {
+    const batchId = nextBatchId();
+    const events = [];
+    const grants = [];
+    let seq = tokenSequence;
+    resources.forEach((resource, index) => {
+      const ttlMsValue = ttlList[index];
+      const minted = mintToken(now, seq);
+      seq = minted.seq;
+      const expiresAt = now + ttlMsValue;
+      events.push({
         v: LOG_VERSION,
         type: 'acquire',
         at: now,
         token: minted.token,
         resource,
-        holder: waiter.holder,
-        ttlMs: waiter.ttlMs,
+        holder,
+        ttlMs: ttlMsValue,
         expiresAt,
-        waitId: waiter.waitId,
-      },
-    };
-  }
-
-  function applyWakeup(wake) {
-    const { waiter } = wake;
-    tokenSequence = wake.seq;
-    knownTokens.add(wake.token);
-    const lease = {
-      resource: waiter.resource,
-      holder: waiter.holder,
-      expiresAt: wake.expiresAt,
-      ttlMs: waiter.ttlMs,
-      legacy: false,
-      heapSeq: 0,
-    };
-    leases.set(wake.token, lease);
-    occupied.set(waiter.resource, wake.token);
-    enqueue(wake.token, lease);
-    counters.granted += 1;
-
-    const queue = waitQueues.get(waiter.resource);
-    queue.shift();
-    if (queue.length === 0) {
-      waitQueues.delete(waiter.resource);
-    }
-    pendingWaiters.delete(waiter.waitId);
-    waiter.ticket.status = 'granted';
-    waiter.ticket.token = wake.token;
-    waiter.ticket.expiresAt = wake.expiresAt;
-  }
-
-  function acquire(resource, holder, ttlMs = defaultTtlMs, waitMs = undefined) {
-    if (!Number.isFinite(ttlMs) || ttlMs <= 0) {
-      throw new TypeError('ttlMs must be a positive finite number');
-    }
-    const wantsWait = waitMs !== undefined && waitMs !== null;
-    if (wantsWait && (!Number.isFinite(waitMs) || waitMs <= 0)) {
-      throw new TypeError('waitMs must be a positive finite number');
-    }
-    const now = clock();
-    purgeExpiredWaiters(now);
-    const currentToken = occupied.get(resource);
-    if (currentToken !== undefined) {
-      const current = leases.get(currentToken);
-      if (isLive(current, now)) {
-        if (!wantsWait) {
-          throw new LeaseTakenError(resource, current.holder);
-        }
-        // Occupied: take a place in line instead of throwing. The resource
-        // does not change hands just because a waiter showed up.
-        return enqueueWaiter(resource, holder, ttlMs, now, waitMs);
-      }
-      // Expired but not yet swept: the resource is free. The stale record is
-      // dropped together with the new grant below (no event of its own).
-    }
-
-    if (waitQueues.has(resource)) {
-      // Queued waiters hold their place in line: a late acquire cannot take
-      // the resource they are waiting for, it can only join the queue.
-      if (!wantsWait) {
-        const stale = currentToken !== undefined
-          ? leases.get(currentToken)
-          : undefined;
-        throw new LeaseTakenError(resource, stale?.holder ?? null);
-      }
-      return enqueueWaiter(resource, holder, ttlMs, now, waitMs);
-    }
-
-    const { token, seq } = mintToken(now);
-    const expiresAt = now + ttlMs;
-    // Persist before touching any state: a failed write leaves the registry
-    // exactly as it was before the call.
-    appendEvent({
-      v: LOG_VERSION,
-      type: 'acquire',
-      at: now,
-      token,
-      resource,
-      holder,
-      ttlMs,
-      expiresAt,
+        batch: batchId,
+      });
+      grants.push({ resource, ttlMs: ttlMsValue, token: minted.token, expiresAt });
     });
+    appendEvents(events);
 
     tokenSequence = seq;
-    knownTokens.add(token);
-    if (currentToken !== undefined) {
-      occupied.delete(resource);
-      leases.delete(currentToken);
+    const result = [];
+    for (const grant of grants) {
+      knownTokens.add(grant.token);
+      const lease = {
+        resource: grant.resource,
+        holder,
+        expiresAt: grant.expiresAt,
+        ttlMs: grant.ttlMs,
+        legacy: false,
+        heapSeq: 0,
+        batch: batchId,
+      };
+      leases.set(grant.token, lease);
+      dropStaleSlots(grant.resource, now);
+      addSlot(grant.resource, grant.token);
+      enqueue(grant.token, lease);
+      counters.granted += 1;
+      result.push({
+        resource: grant.resource,
+        holder,
+        token: grant.token,
+        expiresAt: grant.expiresAt,
+      });
     }
-    const lease = {
-      resource,
-      holder,
-      expiresAt,
-      ttlMs,
-      legacy: false,
-      heapSeq: 0,
-    };
-    leases.set(token, lease);
-    occupied.set(resource, token);
-    enqueue(token, lease);
-    counters.granted += 1;
+    return result;
+  }
 
-    return { resource, holder, token, expiresAt };
+  // Atomic multi-resource acquisition. Every listed occurrence gets its own
+  // credential and independent expiry; either all of them are held, or none
+  // are (the whole request queues instead). ttlMs may be one number or one
+  // ttl per listed resource.
+  function acquireAll(resources, holder, ttlMs = undefined, waitMs = undefined) {
+    if (!Array.isArray(resources) || resources.length === 0) {
+      throw new TypeError('resources must be a non-empty array');
+    }
+    const ttlList = resolveTtls(resources, ttlMs);
+    const wantsWait = validateWait(waitMs);
+    const now = clock();
+    purgeExpiredWaiters(now);
+
+    // Earlier waiters keep their place, and any live lease on a listed
+    // resource blocks the whole batch; a resource listed twice is free for
+    // this request only when it is not held at all.
+    let conflict = null;
+    for (const resource of resources) {
+      if (waitQueues.has(resource) || liveSlotCount(resource, now) > 0) {
+        conflict = resource;
+        break;
+      }
+    }
+
+    if (conflict !== null) {
+      if (!wantsWait) {
+        throw new LeaseTakenError(conflict, liveHolder(conflict, now));
+      }
+      return enqueueGroup(
+        resources, ttlList, holder, now, waitMs, false,
+      ).ticket;
+    }
+
+    return commitDirectGrants(resources, ttlList, holder, now);
+  }
+
+  function acquire(resourceOrResources, holder, ttlMs = undefined, waitMs = undefined) {
+    // Array input is the multi-resource form: same entry point, atomic rules.
+    if (Array.isArray(resourceOrResources)) {
+      return acquireAll(resourceOrResources, holder, ttlMs, waitMs);
+    }
+    const resource = resourceOrResources;
+    const effectiveTtl = ttlMs === undefined ? defaultTtlMs : ttlMs;
+    if (!Number.isFinite(effectiveTtl) || effectiveTtl <= 0) {
+      throw new TypeError('ttlMs must be a positive finite number');
+    }
+    const wantsWait = validateWait(waitMs);
+    const now = clock();
+    purgeExpiredWaiters(now);
+
+    if (liveSlotCount(resource, now) > 0 || waitQueues.has(resource)) {
+      if (!wantsWait) {
+        throw new LeaseTakenError(resource, liveHolder(resource, now));
+      }
+      // Occupied or reserved: take a place in line instead of throwing. The
+      // resource does not change hands just because a waiter showed up.
+      return enqueueGroup(
+        [resource], [effectiveTtl], holder, now, waitMs, true,
+      ).ticket;
+    }
+
+    const [granted] = commitDirectGrants(
+      [resource], [effectiveTtl], holder, now,
+    );
+    return granted;
   }
 
   function renew(token) {
@@ -390,43 +710,40 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     }
     purgeExpiredWaiters(now);
 
-    // A freed resource goes straight to the head of its queue. The wakeup
-    // grant is planned first and appended in the same write as the release,
-    // so a failed log leaves both the lease and the queue untouched.
-    const wake = planWakeup(lease.resource, now, tokenSequence);
+    // The freed resource goes to the requests at the head of its queue; a
+    // group only wakes when every position it needs is free. All wakeup
+    // grants ride in the same write as the release, so a failed log leaves
+    // the lease and every queue untouched.
+    const plans = planWakeups([{ resource: lease.resource, live: true }], now);
     const events = [{ v: LOG_VERSION, type: 'release', at: now, token }];
-    if (wake !== null) {
-      events.push(wake.event);
+    for (const plan of plans) {
+      for (const grant of plan.grants) {
+        events.push(grant.event);
+      }
     }
     appendEvents(events);
 
-    // The record comes off immediately; its queued node retires lazily.
+    // The record comes off immediately; its queued node retires lazily. A
+    // surviving twin credential keeps occupying the resource.
     leases.delete(token);
-    if (occupied.get(lease.resource) === token) {
-      occupied.delete(lease.resource);
-    }
+    removeSlot(lease.resource, token);
     counters.released += 1;
-    if (wake !== null) {
-      applyWakeup(wake);
+    for (const plan of plans) {
+      applyPlannedGrants(plan, now);
     }
     return true;
   }
 
   // Cancelling only lands on a request that is still queued: an already
   // woken, expired or cancelled request reports false, as does an unknown id.
-  function cancel(waitId) {
+  function cancel(requestId) {
     purgeExpiredWaiters(clock());
-    const waiter = pendingWaiters.get(waitId);
-    if (waiter === undefined) {
+    const group = pendingGroups.get(requestId);
+    if (group === undefined) {
       return false;
     }
-    const queue = waitQueues.get(waiter.resource);
-    queue.splice(queue.indexOf(waiter), 1);
-    if (queue.length === 0) {
-      waitQueues.delete(waiter.resource);
-    }
-    pendingWaiters.delete(waiter.waitId);
-    waiter.ticket.status = 'cancelled';
+    detachGroup(group);
+    group.ticket.status = 'cancelled';
     return true;
   }
 
@@ -451,9 +768,9 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
       return [];
     }
 
-    // Reclaimed resources are handed to the head of their queue in the same
-    // expiry order the reclaim happens; every wakeup grant rides along in the
-    // same log write, so a failed append rolls everything back together.
+    // Reclaimed resources are handed to the head requests of their queues in
+    // the same expiry order the reclaim happens; every wakeup grant rides
+    // along in the same log write, so a failed append rolls everything back.
     const events = [{
       v: LOG_VERSION,
       type: 'reclaim',
@@ -463,18 +780,18 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
         resource: leases.get(node.token).resource,
       })),
     }];
-    const wakes = [];
-    let seqCursor = tokenSequence;
-    for (const node of due) {
-      const lease = leases.get(node.token);
-      if (occupied.get(lease.resource) !== node.token) {
-        continue;
-      }
-      const wake = planWakeup(lease.resource, now, seqCursor);
-      if (wake !== null) {
-        seqCursor = wake.seq;
-        wakes.push(wake);
-        events.push(wake.event);
+    // A sweep removes only leases that were already expired, so it vacates
+    // no live occupancy: wake planning treats every freed entry as non-live.
+    const plans = planWakeups(
+      due.map((node) => ({
+        resource: leases.get(node.token).resource,
+        live: false,
+      })),
+      now,
+    );
+    for (const plan of plans) {
+      for (const grant of plan.grants) {
+        events.push(grant.event);
       }
     }
 
@@ -493,14 +810,13 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     for (const node of due) {
       const lease = leases.get(node.token);
       leases.delete(node.token);
-      if (occupied.get(lease.resource) === node.token) {
-        occupied.delete(lease.resource);
+      if (removeSlot(lease.resource, node.token)) {
         counters.reclaimed += 1;
         freed.push(lease.resource);
       }
     }
-    for (const wake of wakes) {
-      applyWakeup(wake);
+    for (const plan of plans) {
+      applyPlannedGrants(plan, now);
     }
     return freed;
   }
@@ -508,25 +824,18 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
   function holder(resource) {
     const now = clock();
     purgeExpiredWaiters(now);
-    const token = occupied.get(resource);
-    if (token === undefined) {
-      return null;
-    }
-    const lease = leases.get(token);
-    if (!isLive(lease, now)) {
-      return null;
-    }
-    return lease.holder;
+    return liveHolder(resource, now);
   }
 
   function stats() {
     let live = 0;
     const now = clock();
     purgeExpiredWaiters(now);
-    for (const token of occupied.values()) {
-      const lease = leases.get(token);
-      if (isLive(lease, now)) {
-        live += 1;
+    for (const list of slots.values()) {
+      for (const token of list) {
+        if (isLive(leases.get(token), now)) {
+          live += 1;
+        }
       }
     }
     return {
@@ -538,9 +847,31 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     };
   }
 
-  replay();
+  // Batch tracking for the acquire events currently being replayed: a batch
+  // takes over a resource as one unit, so its own earlier credentials must
+  // not be treated as the stale leases it replaces.
+  let replayBatchId = null;
+  let replayBatchTokens = new Set();
+  // Highest batch number seen in the log, so ids minted after a restart can
+  // never collide with an earlier process's batches.
+  let replayMaxBatchSeq = 0;
 
-  return { acquire, renew, release, sweep, holder, stats, cancel };
+  replay();
+  batchSequence = Math.max(batchSequence, replayMaxBatchSeq);
+
+  return {
+    acquire,
+    acquireAll,
+    acquireGroup: acquireAll,
+    acquireMany: acquireAll,
+    acquireBatch: acquireAll,
+    renew,
+    release,
+    sweep,
+    holder,
+    stats,
+    cancel,
+  };
 
   function replay() {
     if (logPath === null) {
@@ -598,10 +929,35 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
             `corrupt acquire entry on line ${lineNumber} of ${logPath}`,
           );
         }
-        const previousToken = occupied.get(event.resource);
-        if (previousToken !== undefined && previousToken !== event.token) {
-          // A later grant retook an expired, unswept resource.
-          leases.delete(previousToken);
+        // Credentials minted together for one atomic batch supersede any
+        // expired, unswept lease on the resource as one unit: slots held by
+        // the same batch are kept, everything older is the retaken lease.
+        // Events without a batch marker come from older logs and each stand
+        // on their own, exactly as in the single-resource replay rule.
+        if (event.batch !== undefined && event.batch !== null) {
+          const logged = /^batch-[^-]+-(\d+)$/.exec(String(event.batch));
+          if (logged !== null) {
+            replayMaxBatchSeq = Math.max(
+              replayMaxBatchSeq,
+              Number(logged[1]),
+            );
+          }
+          if (event.batch !== replayBatchId) {
+            replayBatchId = event.batch;
+            replayBatchTokens = new Set();
+          }
+        } else {
+          replayBatchId = null;
+          replayBatchTokens = new Set();
+        }
+        const occupantTokens = slots.get(event.resource);
+        if (occupantTokens !== undefined) {
+          for (const oldToken of [...occupantTokens]) {
+            if (!replayBatchTokens.has(oldToken)) {
+              leases.delete(oldToken);
+              removeSlot(event.resource, oldToken);
+            }
+          }
         }
         const lease = {
           resource: event.resource,
@@ -613,9 +969,11 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
           // renew or release it.
           legacy: true,
           heapSeq: 0,
+          batch: event.batch ?? null,
         };
         leases.set(event.token, lease);
-        occupied.set(event.resource, event.token);
+        addSlot(event.resource, event.token);
+        replayBatchTokens.add(event.token);
         knownTokens.add(event.token);
         enqueue(event.token, lease);
         counters.granted += 1;
@@ -648,9 +1006,7 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
         const lease = leases.get(event.token);
         if (lease !== undefined) {
           leases.delete(event.token);
-          if (occupied.get(lease.resource) === event.token) {
-            occupied.delete(lease.resource);
-          }
+          removeSlot(lease.resource, event.token);
         }
         counters.released += 1;
         break;
@@ -672,9 +1028,7 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
           const lease = leases.get(token);
           if (lease !== undefined) {
             leases.delete(token);
-            if (occupied.get(lease.resource) === token) {
-              occupied.delete(lease.resource);
-            }
+            removeSlot(lease.resource, token);
           }
           counters.reclaimed += 1;
         }
