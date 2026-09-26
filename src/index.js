@@ -32,8 +32,9 @@ LogFileError.code = 'LOG_FILE_ERROR';
 // so reclaiming expired leases only walks entries that are actually due
 // instead of scanning the whole table.
 class ExpiryQueue {
-  constructor() {
+  constructor(before = expiresBefore) {
     this.nodes = [];
+    this.before = before;
   }
 
   get size() {
@@ -46,7 +47,7 @@ class ExpiryQueue {
     let i = nodes.length - 1;
     while (i > 0) {
       const parent = (i - 1) >> 1;
-      if (expiresBefore(nodes[i], nodes[parent])) {
+      if (this.before(nodes[i], nodes[parent])) {
         [nodes[i], nodes[parent]] = [nodes[parent], nodes[i]];
         i = parent;
       } else {
@@ -70,10 +71,10 @@ class ExpiryQueue {
         const left = i * 2 + 1;
         const right = left + 1;
         let next = i;
-        if (left < nodes.length && expiresBefore(nodes[left], nodes[next])) {
+        if (left < nodes.length && this.before(nodes[left], nodes[next])) {
           next = left;
         }
-        if (right < nodes.length && expiresBefore(nodes[right], nodes[next])) {
+        if (right < nodes.length && this.before(nodes[right], nodes[next])) {
           next = right;
         }
         if (next === i) {
@@ -92,6 +93,15 @@ function expiresBefore(a, b) {
     return a.expiresAt < b.expiresAt;
   }
   return a.order < b.order;
+}
+
+// Wait requests are ordered by (deadline, arrival order), so timeout cleanup
+// only ever touches the requests whose budget actually ran out.
+function deadlineBefore(a, b) {
+  if (a.deadline !== b.deadline) {
+    return a.deadline < b.deadline;
+  }
+  return a.arrival < b.arrival;
 }
 
 let registrySequence = 0;
@@ -121,6 +131,11 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
   // occurrence, all belonging to the same request.
   const slots = new Map();
   const expiryQueue = new ExpiryQueue();
+  // Queued wait requests ordered by (deadline, arrival): timeout cleanup pops
+  // only the requests whose budget ran out instead of scanning every pending
+  // request on each operation. Nodes of granted, cancelled or expired
+  // requests retire lazily through the group's detached flag.
+  const waiterDeadlines = new ExpiryQueue(deadlineBefore);
 
   const counters = {
     granted: 0,
@@ -137,6 +152,9 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
   let queueOrder = 0;
   let requestSequence = 0;
   let batchSequence = 0;
+  // Bytes of an unterminated tail line ignored at replay; cut away before the
+  // next append so new events never fuse with the abandoned fragment.
+  let partialTailBytes = 0;
 
   function mintToken(now, seq = tokenSequence) {
     // Pure candidate: nothing is committed until the event is on disk, so a
@@ -153,11 +171,16 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
   }
 
   function enqueue(token, lease) {
+    const order = queueOrder;
+    queueOrder += 1;
+    // Remembered so a snapshot can rebuild the expiry queue in the exact
+    // order it would pop, ties on the expiry instant included.
+    lease.queueOrder = order;
     expiryQueue.push({
       token,
       expiresAt: lease.expiresAt,
       heapSeq: lease.heapSeq,
-      order: queueOrder++,
+      order,
     });
   }
 
@@ -253,6 +276,13 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
       text += `${JSON.stringify(event)}\n`;
     }
     try {
+      if (partialTailBytes > 0) {
+        // An interrupted write left an unterminated tail line: replay already
+        // treated it as never written, so cut it away before new events land.
+        const size = fs.statSync(logPath).size;
+        fs.truncateSync(logPath, size - partialTailBytes);
+        partialTailBytes = 0;
+      }
       fs.appendFileSync(logPath, text);
     } catch (cause) {
       throw new LogFileError(
@@ -267,6 +297,7 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
   }
 
   function detachGroup(group) {
+    group.detached = true;
     for (const position of group.positions) {
       const queue = waitQueues.get(position.resource);
       if (queue === undefined) {
@@ -285,14 +316,20 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
 
   // A queued request gives up once the clock reaches its deadline and is
   // never woken afterwards. Dropping it moves no counter and no ownership.
+  // The deadline heap keeps the closest deadline on top, so cleanup cost
+  // tracks how many requests actually expired, not how many are waiting.
   function purgeExpiredWaiters(now) {
-    const dead = [];
-    for (const group of pendingGroups.values()) {
-      if (group.deadline <= now) {
-        dead.push(group);
+    for (;;) {
+      const node = waiterDeadlines.peek();
+      if (node === undefined || node.deadline > now) {
+        return;
       }
-    }
-    for (const group of dead) {
+      waiterDeadlines.pop();
+      const { group } = node;
+      if (group.detached) {
+        // Granted, cancelled or already expired: retired node.
+        continue;
+      }
       detachGroup(group);
       group.ticket.status = 'expired';
     }
@@ -313,6 +350,7 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
       single,
       ticket,
       positions: [],
+      detached: false,
     };
     // One position per listed occurrence, pushed onto each resource's queue
     // in the given order. Positions of one request land consecutively, so a
@@ -335,6 +373,11 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
       queue.push(position);
     });
     pendingGroups.set(requestId, group);
+    waiterDeadlines.push({
+      deadline: group.deadline,
+      arrival: group.arrival,
+      group,
+    });
     return group;
   }
 
@@ -871,7 +914,84 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     holder,
     stats,
     cancel,
+    compact,
+    snapshot: compact,
   };
+
+  // Rewrite the log as one snapshot line covering every lease the registry
+  // still tracks — resource, holder and absolute expiry of each, whether
+  // live or expired-but-unswept — plus the four cumulative counters, so a
+  // restart comes back exactly as a full replay would. The new log is
+  // written to a temporary file and moved over the old one with an atomic
+  // rename: a crash or failure at any step leaves the original log complete
+  // and usable, and the error carries a code.
+  function compact() {
+    if (logPath === null) {
+      return;
+    }
+    const now = clock();
+    purgeExpiredWaiters(now);
+    const entries = [];
+    for (const [token, lease] of leases) {
+      entries.push({
+        token,
+        resource: lease.resource,
+        holder: lease.holder,
+        expiresAt: lease.expiresAt,
+        ttlMs: lease.ttlMs,
+        order: lease.queueOrder ?? 0,
+      });
+    }
+    // Store the leases in the order the expiry queue would reclaim them, so
+    // the rebuilt queue pops the exact same sequence, ties included.
+    entries.sort((a, b) => {
+      if (a.expiresAt !== b.expiresAt) {
+        return a.expiresAt - b.expiresAt;
+      }
+      return a.order - b.order;
+    });
+    const snapshot = {
+      v: LOG_VERSION,
+      type: 'snapshot',
+      at: now,
+      leases: entries.map(({ order, ...entry }) => entry),
+      counters: {
+        granted: counters.granted,
+        renewed: counters.renewed,
+        released: counters.released,
+        reclaimed: counters.reclaimed,
+      },
+    };
+    const text = `${JSON.stringify(snapshot)}\n`;
+    const temporary = `${logPath}.tmp-${process.pid}`;
+    let descriptor;
+    try {
+      descriptor = fs.openSync(temporary, 'w');
+      fs.writeSync(descriptor, text);
+      fs.fsyncSync(descriptor);
+      fs.closeSync(descriptor);
+      descriptor = undefined;
+      fs.renameSync(temporary, logPath);
+    } catch (cause) {
+      if (descriptor !== undefined) {
+        try {
+          fs.closeSync(descriptor);
+        } catch {
+          // Best effort: the original log is still untouched.
+        }
+      }
+      try {
+        fs.unlinkSync(temporary);
+      } catch {
+        // Best effort: a leftover temp file harms no one.
+      }
+      throw new LogFileError(
+        `failed to compact lease log at ${logPath}`,
+        cause,
+      );
+    }
+    partialTailBytes = 0;
+  }
 
   function replay() {
     if (logPath === null) {
@@ -893,6 +1013,15 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     }
 
     const lines = text.split('\n');
+    // A trailing line without its terminating newline is the leftover of an
+    // interrupted write: it is treated as never written, while every complete
+    // line before it stands. The boundary is the newline itself.
+    if (text.length > 0 && !text.endsWith('\n')) {
+      const tail = lines.pop();
+      if (tail.trim() !== '') {
+        partialTailBytes = Buffer.byteLength(tail, 'utf8');
+      }
+    }
     for (let i = 0; i < lines.length; i += 1) {
       const line = lines[i];
       if (line.trim() === '') {
@@ -919,6 +1048,10 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     }
 
     switch (event.type) {
+      case 'snapshot': {
+        replaySnapshot(event, lineNumber);
+        break;
+      }
       case 'acquire': {
         if (
           typeof event.token !== 'string' ||
@@ -1037,6 +1170,69 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
           `unknown lease log event type on line ${lineNumber} of ${logPath}`,
         );
       }
+    }
+  }
+
+  // A snapshot line replaces everything before it: the leases and counters
+  // it carries are exactly the state the compactor saw, and the events after
+  // it replay on top. Rebuilding assigns the recorded counts directly — it
+  // never accumulates. Anything malformed — unknown version (caught by the
+  // caller), missing counters, a broken lease entry — is a LogFileError, and
+  // the log on disk is left exactly as it was, so the original history can
+  // still be used.
+  function replaySnapshot(event, lineNumber) {
+    const counts = event.counters;
+    if (
+      !Array.isArray(event.leases) ||
+      counts === null || typeof counts !== 'object' ||
+      !Number.isFinite(counts.granted) ||
+      !Number.isFinite(counts.renewed) ||
+      !Number.isFinite(counts.released) ||
+      !Number.isFinite(counts.reclaimed)
+    ) {
+      throw new LogFileError(
+        `corrupt snapshot entry on line ${lineNumber} of ${logPath}`,
+      );
+    }
+    for (const entry of event.leases) {
+      if (
+        entry === null || typeof entry !== 'object' ||
+        typeof entry.token !== 'string' ||
+        !Number.isFinite(entry.expiresAt) ||
+        !Number.isFinite(entry.ttlMs)
+      ) {
+        throw new LogFileError(
+          `corrupt snapshot entry on line ${lineNumber} of ${logPath}`,
+        );
+      }
+    }
+
+    leases.clear();
+    slots.clear();
+    expiryQueue.nodes.length = 0;
+    replayBatchId = null;
+    replayBatchTokens = new Set();
+    counters.granted = counts.granted;
+    counters.renewed = counts.renewed;
+    counters.released = counts.released;
+    counters.reclaimed = counts.reclaimed;
+    for (const entry of event.leases) {
+      const lease = {
+        resource: entry.resource,
+        holder: entry.holder,
+        expiresAt: entry.expiresAt,
+        ttlMs: entry.ttlMs,
+        // Like every credential from before a restart, the ones the snapshot
+        // carries are void: the leases keep occupying their resources, but
+        // the tokens cannot renew or release them.
+        legacy: true,
+        heapSeq: 0,
+        batch: null,
+      };
+      leases.set(entry.token, lease);
+      addSlot(entry.resource, entry.token);
+      knownTokens.add(entry.token);
+      enqueue(entry.token, lease);
     }
   }
 }

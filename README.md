@@ -29,6 +29,8 @@ Node.js 20 or newer. No runtime dependencies.
 - `Registry.holder(resource) -> string | null` reports the current holder.
 - `Registry.stats() -> { granted, renewed, released, reclaimed, live }`.
 - `Registry.cancel(waitId) -> boolean` withdraws a still queued request.
+- `Registry.compact()` (alias `snapshot`) rewrites the log as a single
+  snapshot line; see "Snapshots and compaction" below.
 - `LeaseTakenError` exported class carrying a `code` property.
 - `LogFileError` exported class carrying a `code` property (`'LOG_FILE_ERROR'`).
 
@@ -100,9 +102,31 @@ cumulative counters come back exactly as they were; replay itself adds no
 counts. Credentials issued before the restart are all void: renewing or
 releasing them returns `false`, though the leases they pointed at stay live
 until they expire. A missing log file starts an empty registry; a corrupt
-line or an unrecognized log version throws `LogFileError`. If appending an
-event fails, the operation does not take effect and registry state is rolled
-back to before the call. With `logPath = null` nothing is persisted.
+line or an unrecognized log version throws `LogFileError`. A log whose last
+line was left unterminated by an interrupted write is read up to the final
+complete line: the partial tail is treated as if it never happened — the
+boundary is the newline itself — and it is cut away before the next append.
+If appending an event fails, the operation does not take effect and registry
+state is rolled back to before the call. With `logPath = null` nothing is
+persisted.
+
+### Snapshots and compaction
+
+`Registry.compact()` (also `snapshot()`) rewrites the log as one snapshot
+line recording every lease the registry still tracks — resource, holder and
+absolute expiry of each — plus the four cumulative counters, so the history
+no longer needs to be replayed in full. The new log is written to a
+temporary file and moved over the old one with an atomic rename; if any step
+of the replacement fails, the original log is left complete and usable and a
+`LogFileError` (with its `code`) is thrown. On startup the snapshot is
+loaded first and the events appended after it are replayed on top, so
+ownership, every credential's expiry and the four counters come back exactly
+as they were — rebuilding adds no counts, and credentials issued before the
+compaction stay void. A snapshot with an unrecognized version or corrupt
+content throws `LogFileError`; the failed load touches nothing on disk, so
+falling back to the original log loses no lease. Waiting requests are not
+part of the snapshot: they never survive a restart, the queue comes back
+empty, and only newly queued requests can be woken.
 
 ## Tests
 
