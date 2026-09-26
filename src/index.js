@@ -1,6 +1,11 @@
 // In-process, time bounded lease registry with append-only log persistence.
 // Time only moves when the injected clock moves; nothing expires on its own.
 // Tokens are derived from the injected clock as well, never from wall time.
+//
+// Contended acquisitions may wait in line: a queued request is handed the
+// lease, first come first served, when the resource is released, reclaimed
+// or found expired. Waiting is judged against the injected clock; a request
+// whose wait deadline passes gives up and is never woken.
 
 import fs from 'node:fs';
 
@@ -114,6 +119,11 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
   // resource -> token of the lease currently occupying it
   const occupied = new Map();
   const expiryQueue = new ExpiryQueue();
+  // requestId -> waiting request record. Requests live in memory only: they
+  // are in-flight callers, so nothing about them is persisted or replayed.
+  const requests = new Map();
+  // resource -> FIFO line of waiting request records
+  const waitLines = new Map();
 
   const counters = {
     granted: 0,
@@ -127,19 +137,21 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
   registrySequence += 1;
   const registryId = registrySequence;
   let tokenSequence = 0;
+  let requestSequence = 0;
   let queueOrder = 0;
 
-  function mintToken(now) {
+  function mintToken(now, seq = tokenSequence, alsoTaken = undefined) {
     // Pure candidate: nothing is committed until the event is on disk, so a
     // failed append rolls all the way back. Pids and instance ids can coincide
     // after a restart, so skip any sequence that collides with a credential
-    // reconstructed from the log.
-    let seq = tokenSequence;
+    // reconstructed from the log. `alsoTaken` lets one call mint a batch of
+    // tokens (a sweep waking several waiters) without committing any of them.
     let token;
     do {
       seq += 1;
       token = `lease-${process.pid}-${registryId}-${seq}-${now.toString(36)}`;
-    } while (knownTokens.has(token));
+    } while (knownTokens.has(token) ||
+        (alsoTaken !== undefined && alsoTaken.has(token)));
     return { token, seq };
   }
 
@@ -156,12 +168,18 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     return lease !== undefined && lease.expiresAt > now;
   }
 
-  function appendEvent(event) {
+  function appendEvents(events) {
     if (logPath === null) {
       return;
     }
+    // One write for the whole batch: a freeing operation and the handoffs it
+    // triggers either all land on disk or none of them do.
+    let text = '';
+    for (const event of events) {
+      text += `${JSON.stringify(event)}\n`;
+    }
     try {
-      fs.appendFileSync(logPath, `${JSON.stringify(event)}\n`);
+      fs.appendFileSync(logPath, text);
     } catch (cause) {
       throw new LogFileError(
         `failed to append to lease log at ${logPath}`,
@@ -170,19 +188,176 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     }
   }
 
-  function acquire(resource, holder, ttlMs = defaultTtlMs) {
+  function appendEvent(event) {
+    appendEvents([event]);
+  }
+
+  function normalizeWait(wait) {
+    if (wait === undefined || wait === null) {
+      return undefined;
+    }
+    const waitMs = typeof wait === 'object' ? wait.waitMs : wait;
+    if (!Number.isFinite(waitMs) || waitMs <= 0) {
+      throw new TypeError('waitMs must be a positive finite number');
+    }
+    return waitMs;
+  }
+
+  // Head of the resource's line that is still entitled to the lease, or
+  // undefined. Requests past their wait deadline are marked as given up and
+  // dropped; cancelled records retire here as well. The returned request is
+  // NOT removed from the line: that only happens when the handoff commits,
+  // so a failed log write leaves the line untouched.
+  function nextWaitingRequest(resource, now) {
+    const line = waitLines.get(resource);
+    if (line === undefined) {
+      return undefined;
+    }
+    while (line.length > 0) {
+      const head = line[0];
+      if (head.status !== 'waiting') {
+        line.shift();
+        continue;
+      }
+      if (head.waitDeadline <= now) {
+        head.status = 'timeout';
+        line.shift();
+        continue;
+      }
+      return head;
+    }
+    waitLines.delete(resource);
+    return undefined;
+  }
+
+  function refreshRequest(record) {
+    if (record.status === 'waiting' && record.waitDeadline <= clock()) {
+      record.status = 'timeout';
+    }
+  }
+
+  // Live view of a queued request: the same object reads as waiting, granted,
+  // timeout or cancelled as events unfold. The credential fields only appear
+  // once the request has actually been woken.
+  function requestView(record) {
+    return {
+      get status() {
+        refreshRequest(record);
+        return record.status;
+      },
+      requestId: record.requestId,
+      resource: record.resource,
+      holder: record.holder,
+      waitDeadline: record.waitDeadline,
+      get token() {
+        return record.token;
+      },
+      get expiresAt() {
+        return record.expiresAt;
+      },
+    };
+  }
+
+  function waitInLine(resource, holder, leaseTtlMs, waitMs, now) {
+    requestSequence += 1;
+    const requestId = `request-${process.pid}-${registryId}-${requestSequence}`;
+    const record = {
+      requestId,
+      resource,
+      holder,
+      ttlMs: leaseTtlMs,
+      waitDeadline: now + waitMs,
+      status: 'waiting',
+      token: undefined,
+      expiresAt: undefined,
+    };
+    requests.set(requestId, record);
+    let line = waitLines.get(resource);
+    if (line === undefined) {
+      line = [];
+      waitLines.set(resource, line);
+    }
+    line.push(record);
+    return requestView(record);
+  }
+
+  // The handoff is a real grant: it occupies the resource, carries its own
+  // expiry and counts as granted. Only ever called after the events are on
+  // disk, so a failed write never reaches here.
+  function commitGrant(request, minted, now) {
+    tokenSequence = minted.seq;
+    knownTokens.add(minted.token);
+    const line = waitLines.get(request.resource);
+    if (line !== undefined && line[0] === request) {
+      line.shift();
+      if (line.length === 0) {
+        waitLines.delete(request.resource);
+      }
+    }
+    const expiresAt = now + request.ttlMs;
+    request.status = 'granted';
+    request.token = minted.token;
+    request.expiresAt = expiresAt;
+    const lease = {
+      resource: request.resource,
+      holder: request.holder,
+      expiresAt,
+      ttlMs: request.ttlMs,
+      legacy: false,
+      heapSeq: 0,
+    };
+    leases.set(minted.token, lease);
+    occupied.set(request.resource, minted.token);
+    enqueue(minted.token, lease);
+    counters.granted += 1;
+  }
+
+  function acquire(resource, holder, ttlMs = defaultTtlMs, wait = undefined) {
     if (!Number.isFinite(ttlMs) || ttlMs <= 0) {
       throw new TypeError('ttlMs must be a positive finite number');
     }
+    const waitMs = normalizeWait(wait);
     const now = clock();
     const currentToken = occupied.get(resource);
     if (currentToken !== undefined) {
       const current = leases.get(currentToken);
       if (isLive(current, now)) {
-        throw new LeaseTakenError(resource, current.holder);
+        if (waitMs === undefined) {
+          throw new LeaseTakenError(resource, current.holder);
+        }
+        // Occupied and willing to wait: take a number. The current holder is
+        // not disturbed by the line forming behind it.
+        return waitInLine(resource, holder, ttlMs, waitMs, now);
       }
       // Expired but not yet swept: the resource is free. The stale record is
-      // dropped together with the new grant below (no event of its own).
+      // dropped together with the next grant below (no event of its own).
+    }
+
+    // The resource is free, but a queued request arrived earlier than this
+    // call, so the head of the line is served first and this call is treated
+    // as arriving behind it.
+    const head = nextWaitingRequest(resource, now);
+    if (head !== undefined) {
+      const minted = mintToken(now);
+      appendEvent({
+        v: LOG_VERSION,
+        type: 'acquire',
+        at: now,
+        token: minted.token,
+        resource,
+        holder: head.holder,
+        ttlMs: head.ttlMs,
+        expiresAt: now + head.ttlMs,
+      });
+      if (currentToken !== undefined) {
+        occupied.delete(resource);
+        leases.delete(currentToken);
+      }
+      commitGrant(head, minted, now);
+      if (waitMs === undefined) {
+        throw new LeaseTakenError(resource, head.holder);
+      }
+      return waitInLine(resource, holder, ttlMs, waitMs, now);
     }
 
     const { token, seq } = mintToken(now);
@@ -250,7 +425,26 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     if (lease.expiresAt <= now) {
       return false;
     }
-    appendEvent({ v: LOG_VERSION, type: 'release', at: now, token });
+
+    // The freed resource goes straight to the head of its line; the release
+    // and the handoff are persisted as one atomic append.
+    const head = nextWaitingRequest(lease.resource, now);
+    const events = [{ v: LOG_VERSION, type: 'release', at: now, token }];
+    let minted;
+    if (head !== undefined && occupied.get(lease.resource) === token) {
+      minted = mintToken(now);
+      events.push({
+        v: LOG_VERSION,
+        type: 'acquire',
+        at: now,
+        token: minted.token,
+        resource: lease.resource,
+        holder: head.holder,
+        ttlMs: head.ttlMs,
+        expiresAt: now + head.ttlMs,
+      });
+    }
+    appendEvents(events);
 
     // The record comes off immediately; its queued node retires lazily.
     leases.delete(token);
@@ -258,6 +452,9 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
       occupied.delete(lease.resource);
     }
     counters.released += 1;
+    if (minted !== undefined) {
+      commitGrant(head, minted, now);
+    }
     return true;
   }
 
@@ -281,19 +478,51 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
       return [];
     }
 
-    try {
-      appendEvent({
+    // Each reclaimed resource is handed to the head of its wait line in the
+    // same pass; reclaim and handoffs are persisted as one atomic append.
+    const events = [{
+      v: LOG_VERSION,
+      type: 'reclaim',
+      at: now,
+      items: due.map((node) => ({
+        token: node.token,
+        resource: leases.get(node.token).resource,
+      })),
+    }];
+    const handoffs = [];
+    let seqCursor = tokenSequence;
+    const pendingTokens = new Set();
+    for (const node of due) {
+      const lease = leases.get(node.token);
+      if (occupied.get(lease.resource) !== node.token) {
+        continue;
+      }
+      const head = nextWaitingRequest(lease.resource, now);
+      if (head === undefined) {
+        continue;
+      }
+      const minted = mintToken(now, seqCursor, pendingTokens);
+      seqCursor = minted.seq;
+      pendingTokens.add(minted.token);
+      events.push({
         v: LOG_VERSION,
-        type: 'reclaim',
+        type: 'acquire',
         at: now,
-        items: due.map((node) => ({
-          token: node.token,
-          resource: leases.get(node.token).resource,
-        })),
+        token: minted.token,
+        resource: lease.resource,
+        holder: head.holder,
+        ttlMs: head.ttlMs,
+        expiresAt: now + head.ttlMs,
       });
+      handoffs.push({ request: head, minted });
+    }
+
+    try {
+      appendEvents(events);
     } catch (error) {
       // The write never happened: put the popped nodes back so the queue is
-      // byte-for-byte the same as before the call.
+      // byte-for-byte the same as before the call. Waiting requests were
+      // never dequeued, so the lines are untouched as well.
       for (const node of due) {
         expiryQueue.push(node);
       }
@@ -310,7 +539,53 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
         freed.push(lease.resource);
       }
     }
+    for (const { request, minted } of handoffs) {
+      commitGrant(request, minted, now);
+    }
     return freed;
+  }
+
+  function poll(requestId) {
+    const id = requestId !== null && typeof requestId === 'object'
+      ? requestId.requestId
+      : requestId;
+    const record = requests.get(id);
+    if (record === undefined) {
+      return null;
+    }
+    refreshRequest(record);
+    const snapshot = {
+      status: record.status,
+      requestId: record.requestId,
+      resource: record.resource,
+      holder: record.holder,
+    };
+    if (record.status === 'waiting') {
+      snapshot.waitDeadline = record.waitDeadline;
+    }
+    if (record.status === 'granted') {
+      snapshot.token = record.token;
+      snapshot.expiresAt = record.expiresAt;
+    }
+    return snapshot;
+  }
+
+  function cancel(requestId) {
+    const id = requestId !== null && typeof requestId === 'object'
+      ? requestId.requestId
+      : requestId;
+    const record = requests.get(id);
+    if (record === undefined || record.status !== 'waiting') {
+      // Unknown, already woken, already given up or already cancelled: the
+      // cancel does not land.
+      return false;
+    }
+    if (record.waitDeadline <= clock()) {
+      record.status = 'timeout';
+      return false;
+    }
+    record.status = 'cancelled';
+    return true;
   }
 
   function holder(resource) {
@@ -345,7 +620,7 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
 
   replay();
 
-  return { acquire, renew, release, sweep, holder, stats };
+  return { acquire, renew, release, sweep, holder, stats, poll, cancel };
 
   function replay() {
     if (logPath === null) {
