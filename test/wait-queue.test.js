@@ -414,3 +414,100 @@ test('one freeing wakes exactly one waiter even with several queued', () => {
   assert.equal(registry.stats().granted, 2);
   assert.equal(registry.stats().live, 1);
 });
+
+test('many waiters expire in deadline order, independent of queue order', () => {
+  const clock = fakeClock(0);
+  const registry = createRegistry({ ttlMs: 100, clock });
+  registry.acquire('r', 'a');
+  const n = 2000;
+  const tickets = [];
+  const budgets = [];
+  for (let i = 0; i < n; i += 1) {
+    // 7919 is coprime with n: budgets are a permutation, so queue order and
+    // deadline order differ throughout.
+    const budget = ((i * 7919) % n) + 1;
+    budgets.push(budget);
+    tickets.push(registry.acquire('r', `w${i}`, 10, budget));
+  }
+
+  // Step through deadlines one at a time. Each is unique, so exactly one
+  // request flips per observation; recording it observes the heap's pop
+  // order, which must be deadline order rather than queue order.
+  const expiredOrder = [];
+  for (const budget of [...budgets].sort((a, b) => a - b)) {
+    clock.set(budget);
+    registry.holder('r');
+    for (let i = 0; i < n; i += 1) {
+      if (tickets[i].status === 'expired' && !expiredOrder.includes(i)) {
+        expiredOrder.push(i);
+        break;
+      }
+    }
+  }
+  assert.equal(expiredOrder.length, n);
+  assert.deepEqual(
+    expiredOrder.map((i) => budgets[i]),
+    [...budgets].sort((a, b) => a - b),
+  );
+});
+
+test('a far-future clock observation and a late cancel stay cheap with many waiters', () => {
+  const clock = fakeClock(0);
+  const registry = createRegistry({ ttlMs: 100, clock });
+  registry.acquire('r', 'a');
+  const n = 4000;
+  let live = null;
+  for (let i = 0; i < n; i += 1) {
+    const ticket = registry.acquire('r', `w${i}`, 10, 100000 + i);
+    if (i === n - 1) {
+      live = ticket;
+    }
+  }
+  // Nothing is due: the deadline heap stops at its top, no request is
+  // inspected. Cancelling the tail waiter then still lands exactly once.
+  clock.set(50000);
+  registry.holder('r');
+  assert.equal(registry.cancel(live.waitId), true);
+  assert.equal(registry.cancel(live.waitId), false);
+  assert.equal(registry.stats().granted, 1);
+
+  // Advancing past every deadline expires the rest of the population.
+  clock.set(200000);
+  registry.holder('r');
+});
+
+test('one sweep waking many single waiters grants in arrival order', () => {
+  const clock = fakeClock(0);
+  const registry = createRegistry({ ttlMs: 100, clock });
+  const n = 500;
+  const tickets = [];
+  // Holder leases expire interleaved; waiters queue in resource order.
+  for (let i = 0; i < n; i += 1) {
+    registry.acquire(`r${i}`, 'h', 10 + (i % 5));
+    tickets.push(registry.acquire(`r${i}`, `w${i}`, 100, 1000));
+  }
+  clock.set(100);
+  const freed = registry.sweep();
+  assert.equal(freed.length, n);
+  assert.ok(tickets.every((t) => t.status === 'granted'));
+  assert.equal(registry.stats().granted, 2 * n);
+  // Each woken lease expires independently at the same wake instant.
+  assert.deepEqual([...new Set(tickets.map((t) => t.expiresAt))], [200]);
+});
+
+test('wake planning across many unrelated queued resources still cascades', () => {
+  // A chain of groups where each grant exposes the next head: the planner
+  // must not skip groups whose other position sits on a resource the
+  // triggering event never touched.
+  const clock = fakeClock(0);
+  const registry = createRegistry({ ttlMs: 100, clock });
+  registry.acquire('a', 'h', 10);
+  registry.acquire('b', 'h', 10);
+  const g1 = registry.acquireAll(['a', 'free1'], 'G1', 100, 1000);
+  const g2 = registry.acquireAll(['b', 'free2'], 'G2', 100, 1000);
+
+  clock.set(10);
+  assert.deepEqual(registry.sweep().sort(), ['a', 'b']);
+  assert.equal(g1.status, 'granted');
+  assert.equal(g2.status, 'granted');
+});

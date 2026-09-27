@@ -1,10 +1,25 @@
-// In-process, time bounded lease registry with append-only log persistence.
-// Time only moves when the injected clock moves; nothing expires on its own.
-// Tokens are derived from the injected clock as well, never from wall time.
+// In-process, time bounded lease registry with append-only log persistence
+// and crash-safe snapshots. Time only moves when the injected clock moves;
+// nothing expires on its own. Tokens are derived from the injected clock as
+// well, never from wall time.
+//
+// Persistence layout:
+//   <logPath>           append-only event log, one JSON object per line
+//   <logPath>.snapshot  last compacted state image (single JSON line)
+// Startup loads the snapshot (if any) and replays only the events past the
+// compacted boundary marker. Compaction publishes both files through a
+// temp-file + fsync + rename sequence, so a failure at any step leaves the
+// previous snapshot and the previous log usable. Every event carries a
+// monotonic sequence number; a snapshot found next to an un-exchanged
+// original log (the log swap died after the snapshot rename) simply skips
+// the already-folded events by their sequence ids, so each event applies
+// exactly once regardless of which rename made it to disk.
 
 import fs from 'node:fs';
+import path from 'node:path';
 
 const LOG_VERSION = 1;
+const SNAPSHOT_VERSION = 1;
 
 export class LeaseTakenError extends Error {
   constructor(resource, holder) {
@@ -94,7 +109,74 @@ function expiresBefore(a, b) {
   return a.order < b.order;
 }
 
+// Binary min-heap of wait-request deadlines. Timeout cleanup pops due
+// requests in deadline order instead of scanning every pending request, so
+// a large waiting population costs O(expired * log n), never O(n) per call.
+class DeadlineQueue {
+  constructor() {
+    this.nodes = [];
+  }
+
+  get size() {
+    return this.nodes.length;
+  }
+
+  push(node) {
+    const nodes = this.nodes;
+    nodes.push(node);
+    let i = nodes.length - 1;
+    while (i > 0) {
+      const parent = (i - 1) >> 1;
+      if (deadlineBefore(nodes[i], nodes[parent])) {
+        [nodes[i], nodes[parent]] = [nodes[parent], nodes[i]];
+        i = parent;
+      } else {
+        break;
+      }
+    }
+  }
+
+  peek() {
+    return this.nodes[0];
+  }
+
+  pop() {
+    const nodes = this.nodes;
+    const top = nodes[0];
+    const last = nodes.pop();
+    if (nodes.length > 0) {
+      nodes[0] = last;
+      let i = 0;
+      for (;;) {
+        const left = i * 2 + 1;
+        const right = left + 1;
+        let next = i;
+        if (left < nodes.length && deadlineBefore(nodes[left], nodes[next])) {
+          next = left;
+        }
+        if (right < nodes.length && deadlineBefore(nodes[right], nodes[next])) {
+          next = right;
+        }
+        if (next === i) {
+          break;
+        }
+        [nodes[i], nodes[next]] = [nodes[next], nodes[i]];
+        i = next;
+      }
+    }
+    return top;
+  }
+}
+
+function deadlineBefore(a, b) {
+  if (a.deadline !== b.deadline) {
+    return a.deadline < b.deadline;
+  }
+  return a.tie < b.tie;
+}
+
 let registrySequence = 0;
+let atomicFileSequence = 0;
 
 export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {}) {
   if (!Number.isFinite(ttlMs) || ttlMs <= 0) {
@@ -104,6 +186,7 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     throw new TypeError('clock must be a function');
   }
 
+  const snapshotPath = logPath === null ? null : `${logPath}.snapshot`;
   const defaultTtlMs = ttlMs;
   // resource -> FIFO array of queue positions. A group request listing the
   // same resource twice occupies two consecutive positions in that queue.
@@ -121,6 +204,9 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
   // occurrence, all belonging to the same request.
   const slots = new Map();
   const expiryQueue = new ExpiryQueue();
+  // One node per queued wait request, ordered by wait deadline. Nodes outlive
+  // their request only until the next lazy pop, flagged `dead`.
+  const deadlineQueue = new DeadlineQueue();
 
   const counters = {
     granted: 0,
@@ -135,8 +221,13 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
   const registryId = registrySequence;
   let tokenSequence = 0;
   let queueOrder = 0;
+  let deadlineTie = 0;
   let requestSequence = 0;
   let batchSequence = 0;
+  // Monotonic id stamped on every persisted event; a snapshot records the
+  // last id it folded in, so a log still containing the folded prefix (the
+  // log swap failed) replays those events as no-ops instead of twice.
+  let eventSeq = 0;
 
   function mintToken(now, seq = tokenSequence) {
     // Pure candidate: nothing is committed until the event is on disk, so a
@@ -242,14 +333,64 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     return null;
   }
 
+  function fsyncDirectory(file) {
+    // Best-effort durability for the rename itself: on platforms where
+    // fsyncing a directory handle is unsupported there is nothing to sync,
+    // and the rename has already committed by the time this runs.
+    try {
+      const fd = fs.openSync(path.dirname(file), 'r');
+      try {
+        fs.fsyncSync(fd);
+      } finally {
+        fs.closeSync(fd);
+      }
+    } catch {
+      // Ignored: atomicity of the swap does not depend on it.
+    }
+  }
+
+  // Publish a file via temp + fsync + rename so the target is either the old
+  // complete content or the new complete content, never a mixture. Any failure
+  // leaves the target untouched and surfaces as an assertable LogFileError.
+  function writeAtomic(target, content) {
+    atomicFileSequence += 1;
+    const tmp = `${target}.tmp-${process.pid}-${atomicFileSequence}`;
+    try {
+      const fd = fs.openSync(tmp, 'wx');
+      try {
+        fs.writeFileSync(fd, content, 'utf8');
+        fs.fsyncSync(fd);
+      } finally {
+        fs.closeSync(fd);
+      }
+      fs.renameSync(tmp, target);
+      fsyncDirectory(target);
+    } catch (cause) {
+      try {
+        fs.rmSync(tmp, { force: true });
+      } catch {
+        // The original error is the one the caller must act on.
+      }
+      throw new LogFileError(
+        `failed to write lease file ${target}`,
+        cause,
+      );
+    }
+  }
+
   function appendEvents(events) {
     if (logPath === null) {
       return;
     }
     // One write for the whole batch: an operation that frees resources and
-    // wakes requests either lands completely or not at all.
+    // wakes requests either lands completely or not at all. Sequence ids are
+    // numbered up front but only committed after the write lands, so a failed
+    // append leaves both the log and the counter exactly as before.
     let text = '';
+    let seq = eventSeq;
     for (const event of events) {
+      seq += 1;
+      event.e = seq;
       text += `${JSON.stringify(event)}\n`;
     }
     try {
@@ -260,6 +401,7 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
         cause,
       );
     }
+    eventSeq = seq;
   }
 
   function appendEvent(event) {
@@ -281,18 +423,28 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
       }
     }
     pendingGroups.delete(group.requestId);
+    // Its deadline node retires lazily on the next purge.
+    group.deadlineNode.dead = true;
   }
 
   // A queued request gives up once the clock reaches its deadline and is
-  // never woken afterwards. Dropping it moves no counter and no ownership.
+  // never woken afterwards. Only the deadline heap is consulted: requests
+  // that are still live are never even looked at, no matter how many wait.
   function purgeExpiredWaiters(now) {
-    const dead = [];
-    for (const group of pendingGroups.values()) {
-      if (group.deadline <= now) {
-        dead.push(group);
+    while (deadlineQueue.size > 0) {
+      const node = deadlineQueue.peek();
+      if (node.dead) {
+        deadlineQueue.pop();
+        continue;
       }
-    }
-    for (const group of dead) {
+      if (node.deadline > now) {
+        break;
+      }
+      deadlineQueue.pop();
+      const group = pendingGroups.get(node.requestId);
+      if (group === undefined || group.deadlineNode !== node) {
+        continue;
+      }
       detachGroup(group);
       group.ticket.status = 'expired';
     }
@@ -305,15 +457,19 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
       // Exact baseline shape for single-resource callers.
       ? { status: 'waiting', resource: resources[0], holder, waitId: requestId }
       : { status: 'waiting', resources: [...resources], holder, waitId: requestId };
+    deadlineTie += 1;
+    const deadlineNode = { requestId, deadline: now + waitMs, tie: deadlineTie, dead: false };
     const group = {
       requestId,
       arrival: requestSequence,
       holder,
       deadline: now + waitMs,
+      deadlineNode,
       single,
       ticket,
       positions: [],
     };
+    deadlineQueue.push(deadlineNode);
     // One position per listed occurrence, pushed onto each resource's queue
     // in the given order. Positions of one request land consecutively, so a
     // repeated resource lines up as many times as it was listed.
@@ -484,9 +640,17 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
   // { resource, live }: a release vacates a live credential, a reclaim only
   // removes one that had already expired. Everything planned rides in the
   // triggering log write.
+  //
+  // Only requests standing at the head of a queue touched by the event (plus
+  // the requests exposed behind a batch planned in this cascade) can possibly
+  // be fillable: a request was not fillable when it queued, and nothing else
+  // changed. Wake planning therefore never inspects requests waiting on
+  // unrelated resources, regardless of how many are queued in total.
   function planWakeups(freedEntries, now) {
     const freedLiveCount = new Map();
+    const touched = new Set();
     for (const entry of freedEntries) {
+      touched.add(entry.resource);
       if (entry.live) {
         freedLiveCount.set(
           entry.resource,
@@ -495,14 +659,25 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
       }
     }
     const plans = [];
+    const planned = new Set();
+    const candidates = new Set();
+    const seedHead = (resource) => {
+      const queue = waitQueues.get(resource);
+      if (queue !== undefined && queue.length > 0) {
+        candidates.add(queue[0].group);
+      }
+    };
+    for (const resource of touched) {
+      seedHead(resource);
+    }
     let seq = tokenSequence;
     for (;;) {
       // Candidates are picked strictly by arrival order: the earliest
       // pending request whose batch is now complete wins, so no resource's
       // queue can jump ahead of an earlier request.
       let next = null;
-      for (const group of pendingGroups.values()) {
-        if (plans.some((plan) => plan.group === group)) {
+      for (const group of candidates) {
+        if (planned.has(group)) {
           continue;
         }
         if (!groupFillable(group, plans, freedLiveCount, now)) {
@@ -518,6 +693,23 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
       const plan = planGroupGrants(next, now, seq);
       seq = plan.seq;
       plans.push(plan);
+      planned.add(next);
+      candidates.delete(next);
+      // The granted batch leaves its queues; expose the first request behind
+      // it on each resource it took, as a candidate for the same cascade.
+      const resources = new Set(plan.grants.map((grant) => grant.resource));
+      for (const resource of resources) {
+        const queue = waitQueues.get(resource);
+        if (queue === undefined) {
+          continue;
+        }
+        for (const position of queue) {
+          if (!planned.has(position.group)) {
+            candidates.add(position.group);
+            break;
+          }
+        }
+      }
     }
     return plans;
   }
@@ -848,17 +1040,114 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     };
   }
 
+  // Fold the whole history into one snapshot and restart the event log from
+  // that point. The snapshot is published first (temp + fsync + rename) and
+  // the trimmed log second; a failure at either step leaves the previously
+  // usable files in place and throws LogFileError. Credentials captured by
+  // the snapshot are void afterwards, exactly as across a restart.
+  function compact(now = clock()) {
+    if (logPath === null) {
+      throw new LogFileError('cannot compact a registry without a logPath');
+    }
+
+    // Read the log up front: an unreadable log must fail compaction rather
+    // than replacing it. Every complete line is already reflected in the
+    // in-memory state; an unterminated fragment at the tail (an append that
+    // died with the process) is folded nowhere and is dropped by the rewrite.
+    try {
+      fs.readFileSync(logPath, 'utf8');
+    } catch (cause) {
+      if (cause.code !== 'ENOENT') {
+        throw new LogFileError(`failed to read lease log at ${logPath}`, cause);
+      }
+    }
+
+    // The image carries every lease still in the table, including expired
+    // ones nobody has swept yet, so a sweep after compaction frees and counts
+    // them in exactly the same order as before. Only live credentials show in
+    // ownership and liveness either way.
+    //
+    // Equal expiry times are tie-broken by expiry-heap insertion order
+    // (renewals push a fresh node), so remember each lease's current node
+    // order and serialize in heap-pop order: reclaim order is then identical
+    // after a restart even when several credentials expire at the same
+    // instant.
+    const activeOrder = new Map();
+    for (const node of expiryQueue.nodes) {
+      const lease = leases.get(node.token);
+      if (lease !== undefined && lease.heapSeq === node.heapSeq) {
+        activeOrder.set(node.token, node.order);
+      }
+    }
+    const leaseEntries = [];
+    for (const [token, lease] of leases.entries()) {
+      leaseEntries.push({
+        token,
+        resource: lease.resource,
+        holder: lease.holder,
+        expiresAt: lease.expiresAt,
+        ttlMs: lease.ttlMs,
+        batch: lease.batch ?? null,
+        // Local tie-breaker for the sort below; stripped before writing.
+        order: activeOrder.get(token) ?? 0,
+      });
+    }
+    leaseEntries.sort((a, b) =>
+      a.expiresAt !== b.expiresAt
+        ? a.expiresAt - b.expiresAt
+        : a.order - b.order);
+    for (const entry of leaseEntries) {
+      delete entry.order;
+    }
+    const snapshot = {
+      v: SNAPSHOT_VERSION,
+      type: 'snapshot',
+      at: now,
+      seq: eventSeq,
+      tokenSeq: tokenSequence,
+      batchSeq: batchSequence,
+      counters: { ...counters },
+      leases: leaseEntries,
+    };
+
+    // 1. Publish the snapshot. If this fails, nothing else has moved and the
+    //    original log stays the sole source of truth.
+    writeAtomic(snapshotPath, `${JSON.stringify(snapshot)}\n`);
+    // 2. Replace the log with a boundary marker naming the last folded event
+    //    sequence. Every complete line was folded into the image, so the only
+    //    thing dropped here is an unterminated fragment; later events append
+    //    after the marker. If this rename never happens after a committed
+    //    snapshot, startup finds no marker, folds the whole log and skips
+    //    every event whose sequence is already in the image; either order
+    //    yields each event exactly once.
+    const marker = {
+      v: LOG_VERSION,
+      type: 'snapshot-start',
+      seq: eventSeq,
+    };
+    writeAtomic(logPath, `${JSON.stringify(marker)}\n`);
+
+    return { seq: eventSeq, leases: leaseEntries.length };
+  }
+
   // Credentials of the atomic batch currently being replayed: a batch takes
   // over a resource as one unit, so its own earlier credentials must not be
   // treated as the stale lease it replaces.
   let replayBatchId = null;
   let replayBatchTokens = new Set();
-  // Highest batch number seen in the log, so ids minted after a restart can
-  // never collide with an earlier process's batches.
+  // Highest batch/event number seen in the log, so ids minted after a restart
+  // can never collide with an earlier process's.
   let replayMaxBatchSeq = 0;
+  let replayMaxEventSeq = 0;
+  let replayMaxTokenSeq = 0;
 
-  replay();
+  load();
   batchSequence = Math.max(batchSequence, replayMaxBatchSeq);
+  eventSeq = Math.max(eventSeq, replayMaxEventSeq);
+  // Folded events are skipped during replay, so their credentials (including
+  // released or reclaimed ones absent from the image) can never come back
+  // from the minting loop alone; the snapshot carries the high-water mark.
+  tokenSequence = Math.max(tokenSequence, replayMaxTokenSeq);
 
   return {
     acquire,
@@ -871,10 +1160,20 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     holder,
     stats,
     cancel,
+    compact,
   };
 
-  function replay() {
+  function load() {
     if (logPath === null) {
+      return;
+    }
+
+    const snapshot = readSnapshot();
+    if (snapshot === 'empty') {
+      // A snapshot file with no content declares the old history gone:
+      // start from a brand-new log and remove the stale files.
+      removeIfPresent(snapshotPath);
+      removeIfPresent(logPath);
       return;
     }
 
@@ -883,31 +1182,239 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
       text = fs.readFileSync(logPath, 'utf8');
     } catch (cause) {
       if (cause.code === 'ENOENT') {
-        // No log yet: start from an empty registry.
-        return;
+        text = '';
+      } else {
+        throw new LogFileError(`failed to read lease log at ${logPath}`, cause);
       }
+    }
+
+    // A write that died mid-line leaves bytes after the final newline.
+    // Complete entries stay in force; the unterminated fragment never
+    // happened, and is trimmed so later appends start on a fresh line.
+    const lastNewline = text.lastIndexOf('\n');
+    const validLength = lastNewline === -1 ? 0 : lastNewline + 1;
+    if (validLength < text.length) {
+      try {
+        fs.truncateSync(logPath, validLength);
+      } catch (cause) {
+        throw new LogFileError(
+          `failed to trim torn tail from lease log at ${logPath}`,
+          cause,
+        );
+      }
+    }
+
+    const validText = text.slice(0, validLength);
+    if (snapshot === null) {
+      replayStream(validText, 0, false, 0);
+      return;
+    }
+
+    // A compacted log is always exactly a marker line followed by the tail
+    // events. No marker means the swap never committed and the log still
+    // holds the whole folded history; the sequence ids make those events
+    // apply exactly once.
+    const lines = validText === '' ? [] : validText.split('\n');
+    let startsAt = 0;
+    if (lines.length > 0 && lines[0] !== '') {
+      const marker = parseMarker(lines[0], 1);
+      if (marker !== null) {
+        replayMaxEventSeq = Math.max(replayMaxEventSeq, marker.seq);
+        startsAt = 1;
+      }
+    }
+
+    applySnapshot(snapshot);
+    replayStream(lines.slice(startsAt).join('\n'), startsAt, true, snapshot.seq);
+  }
+
+  // Structural boundary line a compacted log begins with. It carries the
+  // last folded event sequence, mirroring the snapshot.
+  function parseMarker(line, lineNumber) {
+    let value;
+    try {
+      value = JSON.parse(line);
+    } catch (cause) {
       throw new LogFileError(
-        `failed to read lease log at ${logPath}`,
+        `corrupt lease log entry on line ${lineNumber} of ${logPath}`,
+        cause,
+      );
+    }
+    if (
+      value === null ||
+      typeof value !== 'object' ||
+      value.v !== LOG_VERSION ||
+      value.type !== 'snapshot-start'
+    ) {
+      return null;
+    }
+    if (!Number.isInteger(value.seq) || value.seq < 0) {
+      throw new LogFileError(
+        `corrupt snapshot marker on line ${lineNumber} of ${logPath}`,
+      );
+    }
+    return value;
+  }
+
+  function removeIfPresent(file) {
+    try {
+      fs.rmSync(file, { force: true });
+    } catch (cause) {
+      if (cause.code !== 'ENOENT') {
+        throw new LogFileError(`failed to remove stale lease file ${file}`, cause);
+      }
+    }
+  }
+
+  // Read and classify the snapshot file:
+  //   null      no snapshot file: replay the log from the beginning
+  //   'empty'   file present but with no content: start a brand-new log
+  //   object    a usable snapshot
+  // A damaged image or an unrecognized snapshot version throws LogFileError;
+  // the original log is never touched, so it stays a complete fallback.
+  function readSnapshot() {
+    let raw;
+    try {
+      raw = fs.readFileSync(snapshotPath, 'utf8');
+    } catch (cause) {
+      if (cause.code === 'ENOENT') {
+        return null;
+      }
+      throw new LogFileError(`failed to read lease snapshot at ${snapshotPath}`, cause);
+    }
+
+    if (raw.trim() === '') {
+      // Content missing: the declared behaviour is a fresh start.
+      return 'empty';
+    }
+
+    let value;
+    try {
+      value = JSON.parse(raw);
+    } catch (cause) {
+      throw new LogFileError(
+        `corrupt lease snapshot at ${snapshotPath}`,
         cause,
       );
     }
 
+    if (value === null || typeof value !== 'object') {
+      throw new LogFileError(`corrupt lease snapshot at ${snapshotPath}`);
+    }
+    if (value.v !== SNAPSHOT_VERSION || value.type !== 'snapshot') {
+      // Unknown version or damaged envelope: refuse to guess.
+      throw new LogFileError(
+        `unrecognized lease snapshot version at ${snapshotPath}`,
+      );
+    }
+    if (
+      value.counters === undefined ||
+      value.leases === undefined ||
+      value.seq === undefined
+    ) {
+      // Recognizable envelope, no payload: content is missing.
+      return 'empty';
+    }
+    if (
+      typeof value.counters !== 'object' ||
+      value.counters === null ||
+      !Array.isArray(value.leases) ||
+      !Number.isInteger(value.seq) ||
+      value.seq < 0 ||
+      (value.tokenSeq !== undefined &&
+        (!Number.isInteger(value.tokenSeq) || value.tokenSeq < 0)) ||
+      !Number.isFinite(value.at) ||
+      (value.batchSeq !== undefined &&
+        (!Number.isInteger(value.batchSeq) || value.batchSeq < 0))
+    ) {
+      throw new LogFileError(`corrupt lease snapshot at ${snapshotPath}`);
+    }
+
+    for (const key of ['granted', 'renewed', 'released', 'reclaimed']) {
+      if (!Number.isFinite(value.counters[key])) {
+        throw new LogFileError(`corrupt lease snapshot counters at ${snapshotPath}`);
+      }
+    }
+    for (const entry of value.leases) {
+      if (
+        entry === null ||
+        typeof entry !== 'object' ||
+        typeof entry.token !== 'string' ||
+        !Number.isFinite(entry.ttlMs) ||
+        !Number.isFinite(entry.expiresAt)
+      ) {
+        throw new LogFileError(`corrupt lease snapshot lease at ${snapshotPath}`);
+      }
+    }
+
+    return value;
+  }
+
+  function applySnapshot(snapshot) {
+    counters.granted = snapshot.counters.granted;
+    counters.renewed = snapshot.counters.renewed;
+    counters.released = snapshot.counters.released;
+    counters.reclaimed = snapshot.counters.reclaimed;
+    replayMaxEventSeq = snapshot.seq;
+    replayMaxTokenSeq = snapshot.tokenSeq ?? 0;
+    replayMaxBatchSeq = snapshot.batchSeq ?? 0;
+    for (const entry of snapshot.leases) {
+      const lease = {
+        resource: entry.resource,
+        holder: entry.holder,
+        expiresAt: entry.expiresAt,
+        ttlMs: entry.ttlMs,
+        // Credentials captured before this process started are void: the
+        // lease keeps occupying the resource, but its token cannot renew or
+        // release it.
+        legacy: true,
+        heapSeq: 0,
+        batch: entry.batch ?? null,
+      };
+      leases.set(entry.token, lease);
+      addSlot(entry.resource, entry.token);
+      knownTokens.add(entry.token);
+      enqueue(entry.token, lease);
+    }
+  }
+
+  // Replay one chunk of complete log lines. In folded mode the snapshot is
+  // already applied and events at or before foldedSeq are skipped; events
+  // without a sequence id are folded history written by an older format and
+  // are skipped as well. firstLineNumber only labels error messages.
+  function replayStream(text, firstLineNumber, folded, foldedSeq) {
+    if (text === '') {
+      return;
+    }
     const lines = text.split('\n');
     for (let i = 0; i < lines.length; i += 1) {
       const line = lines[i];
-      if (line.trim() === '') {
+      if (line === '') {
         continue;
       }
+      const lineNumber = firstLineNumber + i + 1;
       let event;
       try {
         event = JSON.parse(line);
       } catch (cause) {
         throw new LogFileError(
-          `corrupt lease log entry on line ${i + 1} of ${logPath}`,
+          `corrupt lease log entry on line ${lineNumber} of ${logPath}`,
           cause,
         );
       }
-      replayEvent(event, i + 1);
+      if (folded) {
+        if (
+          event === null ||
+          typeof event !== 'object' ||
+          !Number.isInteger(event.e) ||
+          event.e <= foldedSeq
+        ) {
+          // Already part of the snapshot image (or a legacy event folded in
+          // before sequence ids existed).
+          continue;
+        }
+      }
+      replayEvent(event, lineNumber);
     }
   }
 
@@ -916,6 +1423,9 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
       throw new LogFileError(
         `unrecognized lease log version on line ${lineNumber} of ${logPath}`,
       );
+    }
+    if (Number.isInteger(event.e)) {
+      replayMaxEventSeq = Math.max(replayMaxEventSeq, event.e);
     }
 
     switch (event.type) {
@@ -978,7 +1488,6 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
         break;
       }
       case 'renew': {
-        const lease = leases.get(event.token);
         if (
           typeof event.token !== 'string' ||
           !Number.isFinite(event.expiresAt)
@@ -987,6 +1496,7 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
             `corrupt renew entry on line ${lineNumber} of ${logPath}`,
           );
         }
+        const lease = leases.get(event.token);
         if (lease !== undefined) {
           lease.expiresAt = event.expiresAt;
           lease.heapSeq += 1;
