@@ -3,6 +3,14 @@
 // nothing expires on its own. Tokens are derived from the injected clock as
 // well, never from wall time.
 //
+// Resources may be declared with a share capacity: several holders then
+// occupy the same resource at once, each holding one credential per share
+// with its own independent expiry. An undeclared resource stays a
+// single-occupancy resource exactly as before. Hierarchical quotas sit above
+// resources: a parent quota bounds the sum of the shares occupied under every
+// quota below it (and directly declared resources), and every level is
+// enforced at once.
+//
 // Persistence layout:
 //   <logPath>           append-only event log, one JSON object per line
 //   <logPath>.snapshot  last compacted state image (single JSON line)
@@ -22,15 +30,30 @@ const LOG_VERSION = 1;
 const SNAPSHOT_VERSION = 1;
 
 export class LeaseTakenError extends Error {
-  constructor(resource, holder) {
+  constructor(resource, holder, requested = undefined, available = undefined) {
     super(`lease for resource ${String(resource)} is already held`);
     this.name = 'LeaseTakenError';
     this.code = LeaseTakenError.code;
     this.resource = resource;
     this.holder = holder ?? null;
+    this.requested = requested;
+    this.available = available;
   }
 }
 LeaseTakenError.code = 'LEASE_TAKEN';
+
+export class QuotaExceededError extends Error {
+  constructor(quota, holder, requested, available) {
+    super(`quota ${String(quota)} has no room for ${requested} requested share(s)`);
+    this.name = 'QuotaExceededError';
+    this.code = QuotaExceededError.code;
+    this.quota = quota;
+    this.holder = holder ?? null;
+    this.requested = requested;
+    this.available = available;
+  }
+}
+QuotaExceededError.code = 'QUOTA_EXCEEDED';
 
 export class LogFileError extends Error {
   constructor(message, cause) {
@@ -42,10 +65,12 @@ export class LogFileError extends Error {
 }
 LogFileError.code = 'LOG_FILE_ERROR';
 
-// Binary min-heap ordered by (expiresAt, insertion order). Every live lease
-// has a node in the queue; renewals push a fresh node and retire the old one,
-// so reclaiming expired leases only walks entries that are actually due
-// instead of scanning the whole table.
+// Binary min-heap ordered by (expiresAt, insertion order). Expiry heaps are
+// used three ways: one global heap drives reclamation, each resource gets one
+// for lazy capacity accounting, and each quota node gets one for lazy quota
+// accounting. Renewals push fresh nodes and retire the old ones, so reclaiming
+// expired leases only walks entries that are actually due instead of scanning
+// the whole table.
 class ExpiryQueue {
   constructor() {
     this.nodes = [];
@@ -189,20 +214,30 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
   const snapshotPath = logPath === null ? null : `${logPath}.snapshot`;
   const defaultTtlMs = ttlMs;
   // resource -> FIFO array of queue positions. A group request listing the
-  // same resource twice occupies two consecutive positions in that queue.
+  // same resource in several rows occupies one position per row.
   const waitQueues = new Map();
   // requestId -> group, while the request is still queued.
   const pendingGroups = new Map();
-  // token -> { resource, holder, expiresAt, ttlMs, legacy, heapSeq }
+  // token -> { resource, holder, expiresAt, ttlMs, legacy, heapSeq, chain,
+  // counted }
   const leases = new Map();
   // Every token this instance knows about, including replayed credentials
   // that were already released or reclaimed, so a freshly minted token can
   // never reuse a dead credential's string.
   const knownTokens = new Set();
-  // resource -> tokens currently occupying it. Usually one entry; an atomic
-  // group listing one resource several times holds one credential per
-  // occurrence, all belonging to the same request.
+  // resource -> Set of tokens currently attached to it. A share resource
+  // usually carries several live credentials; the set makes release and
+  // reclaim O(1) regardless of how many shares coexist.
   const slots = new Map();
+  // resource -> runtime bookkeeping. Created lazily; an undeclared resource
+  // is a capacity-1 resource with no quota chain.
+  const resourceStates = new Map();
+  // quota id -> { id, parentId, limit, live, heap, resources }. `live` is the
+  // current share occupation counted against the limit, maintained per share
+  // grant and released lazily by the quota's own expiry heap.
+  const quotas = new Map();
+  // The global expiry heap drives sweep(); resource and quota heaps drive
+  // lazy, sub-linear availability checks.
   const expiryQueue = new ExpiryQueue();
   // One node per queued wait request, ordered by wait deadline. Nodes outlive
   // their request only until the next lazy pop, flagged `dead`.
@@ -243,92 +278,354 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     return { token, seq };
   }
 
-  function enqueue(token, lease) {
-    expiryQueue.push({
-      token,
-      expiresAt: lease.expiresAt,
-      heapSeq: lease.heapSeq,
-      order: queueOrder++,
-    });
+  function newExpiryNode(token, expiresAt, heapSeq) {
+    return { token, expiresAt, heapSeq, order: queueOrder++ };
+  }
+
+  // One node in every heap a lease occupies. The nodes are independent: each
+  // heap retires its own stale entries lazily. Every push also bumps the
+  // owner's heap version, so a reconcile at an unchanged reading still
+  // re-judges after a grant or renewal changed the heap contents.
+  // Push one lease node to the global expiry heap and to every owner
+  // whose heap drives lazy observation. A share already recorded as
+  // retired at an owner (a replay structurally superseding an unswept
+  // lease) only needs its global node - it must be reclaimable - and is
+  // skipped on that owner's heap, since its occupation was never
+  // reconstructed there. Every other push bumps the owner's heap
+  // version, so a reconcile at an unchanged reading still re-judges
+  // after a grant or renewal changed the heap contents.
+  function pushLeaseHeaps(token, lease) {
+    const node = newExpiryNode(token, lease.expiresAt, lease.heapSeq);
+    expiryQueue.push(node);
+    const rs = resourceStates.get(lease.resource);
+    rs.heap.push(newExpiryNode(token, lease.expiresAt, lease.heapSeq));
+    rs.version += 1;
+    for (const quota of lease.chain) {
+      quota.heap.push(newExpiryNode(token, lease.expiresAt, lease.heapSeq));
+      quota.version += 1;
+    }
+  }
+
+  // Peek an owner heap for a lease that is live at `now` without
+  // mutating anything: stale nodes are inspected but left in place for a
+  // later reconcile to retire or for a dropStaleSlots displacement.
+  function hasLiveHeapNode(owner, now) {
+    for (const node of owner.heap.nodes) {
+      const lease = leases.get(node.token);
+      if (lease !== undefined && lease.heapSeq === node.heapSeq && node.expiresAt > now) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Remove every node naming `token` from one expiry heap. Used when a
+  // replay structurally supersedes an expired, unswept lease: the stale
+  // share never occupied the reconstructed owner table, so its node leaves
+  // the owner heap without any live-usage movement. Tokens are globally
+  // unique, so matching the token alone (not the heap sequence) separates a
+  // superseded lease from a fresh credential that happens to share seq 0.
+  function removeHeapNodes(heap, token) {
+    let i = 0;
+    while (i < heap.nodes.length) {
+      if (heap.nodes[i].token === token) {
+        heap.nodes.splice(i, 1);
+      } else {
+        i += 1;
+      }
+    }
+    // Restore the heap invariant in linear time after the removals.
+    const nodes = heap.nodes;
+    for (let j = (nodes.length >>> 1) - 1; j >= 0; j -= 1) {
+      let parent = j;
+      for (;;) {
+        const left = parent * 2 + 1;
+        const right = left + 1;
+        let smallest = parent;
+        if (left < nodes.length && expiresBefore(nodes[left], nodes[smallest])) {
+          smallest = left;
+        }
+        if (right < nodes.length && expiresBefore(nodes[right], nodes[smallest])) {
+          smallest = right;
+        }
+        if (smallest === parent) {
+          break;
+        }
+        [nodes[parent], nodes[smallest]] = [nodes[smallest], nodes[parent]];
+        parent = smallest;
+      }
+    }
   }
 
   function isLive(lease, now) {
     return lease !== undefined && lease.expiresAt > now;
   }
 
-  function getSlots(resource) {
-    let list = slots.get(resource);
-    if (list === undefined) {
-      list = [];
-      slots.set(resource, list);
+  function resourceStateFor(resource) {
+    let rs = resourceStates.get(resource);
+    if (rs === undefined) {
+      rs = {
+        capacity: 1,
+        chain: [],
+        declared: false,
+        live: 0,
+        heap: new ExpiryQueue(),
+        // Shares observed expired (and so not counted at the current
+        // reading) but still in the lease table awaiting a sweep. The map is
+        // reversible: a reading that goes backwards revives entries that are
+        // live again, exactly as a fresh isLive judgment would.
+        retired: new Map(),
+        watermark: -Infinity,
+        checkedVersion: -1,
+        // Heap layout version, bumped whenever a node is pushed (a grant or
+        // a renewal moves a share's expiry): a reconcile at an unchanged
+        // reading must still run again after a renewal so the new expiry is
+        // judged at that reading.
+        version: 0,
+        // quota -> number of queued positions on this resource under it; the
+        // set drives quota-indexed wake seeding.
+        waitRefs: new Map(),
+      };
+      resourceStates.set(resource, rs);
     }
-    return list;
+    return rs;
+  }
+
+  function quotaChainFor(leafId) {
+    const chain = [];
+    let current = leafId;
+    while (current !== null && current !== undefined) {
+      const node = quotas.get(current);
+      if (node === undefined) {
+        throw new TypeError(`unknown quota ${String(current)}`);
+      }
+      chain.push(node);
+      current = node.parentId;
+    }
+    chain.reverse();
+    return chain;
+  }
+
+  // Forget a lease from every owner's retired set without touching its
+  // live usage: the share was already observed expired (a sweep projected
+  // the retirement before its reclaim event landed).
+  function purgeRetired(lease) {
+    const rs = resourceStates.get(lease.resource);
+    if (rs !== undefined) {
+      rs.retired.delete(lease.token);
+    }
+    for (const quota of lease.chain) {
+      quota.retired.delete(lease.token);
+    }
+  }
+
+  // Permanently remove a lease from the table (early release, reclaim, a
+  // single-occupancy retake, or a replay superseding it). Owners that were
+  // still counting the share lose it; owners that had already observed it
+  // expired simply forget its retired entry.
+  function retirePermanent(lease) {
+    if (lease === undefined) {
+      return;
+    }
+    const rs = resourceStates.get(lease.resource);
+    if (rs !== undefined) {
+      if (!rs.retired.has(lease.token)) {
+        rs.live -= 1;
+      }
+      rs.retired.delete(lease.token);
+    }
+    for (const quota of lease.chain) {
+      if (!quota.retired.has(lease.token)) {
+        quota.live -= 1;
+      }
+      quota.retired.delete(lease.token);
+    }
+  }
+
+  // Reconcile one occupancy owner (a resource or one quota level) with the
+  // passed clock reading. Occupancy is judged the way isLive judges it -
+  // `expiresAt > now` - at every call, so a reading that goes backwards
+  // revives shares an earlier reading had already retired. The owner's
+  // watermark makes a monotonic sequence of readings pop lazily in expiry
+  // order, and a backwards reading walk the retired set back onto the heap.
+  function reconcile(owner, now) {
+    const retired = [];
+    if (now === owner.watermark && owner.version === owner.checkedVersion) {
+      return retired;
+    }
+    if (now > owner.watermark) {
+      while (owner.heap.size > 0) {
+        const node = owner.heap.peek();
+        if (node.expiresAt > now) {
+          break;
+        }
+        owner.heap.pop();
+        const lease = leases.get(node.token);
+        if (lease === undefined) {
+          // Released or reclaimed.
+          continue;
+        }
+        if (lease.heapSeq !== node.heapSeq) {
+          // Superseded by a renewal: discard the old node without retiring
+          // anything (its heap entry is stale) and keep scanning.
+          continue;
+        }
+        if (owner.retired.has(node.token)) {
+          // Either a share that revived after a backwards reading and
+          // expired again, or a share a replay retake structurally
+          // superseded: its first retirement already moved this owner's
+          // usage, so the heap node is simply dropped.
+          continue;
+        }
+        owner.retired.set(node.token, {
+          heapSeq: node.heapSeq,
+          expiresAt: node.expiresAt,
+        });
+        owner.live -= 1;
+        retired.push(node);
+      }
+    } else {
+      // The reading moved backwards: every retired share that is live again
+      // under the earlier reading returns, and its node goes back on the heap
+      // so a later forward reading retires it in proper expiry order.
+      for (const [token, record] of owner.retired) {
+        const lease = leases.get(token);
+        if (lease === undefined || lease.heapSeq !== record.heapSeq) {
+          // Released/reclaimed meanwhile, or renewed after a revival: the
+          // old record describes nothing current.
+          owner.retired.delete(token);
+          continue;
+        }
+        if (record.expiresAt > now) {
+          owner.retired.delete(token);
+          const node = {
+            token,
+            expiresAt: record.expiresAt,
+            heapSeq: record.heapSeq,
+            order: queueOrder++,
+          };
+          owner.heap.push(node);
+          owner.live += 1;
+          retired.push({ node, revived: true });
+        }
+      }
+    }
+    owner.watermark = now;
+    owner.checkedVersion = owner.version;
+    return retired;
+  }
+
+  // Project a batch of global reclaim nodes through every owner they
+  // occupy before wake planning in a sweep. Returns a record able to put
+  // every owner exactly back if the log write fails.
+  function projectReclaims(due, now) {
+    const touched = [];
+    const seen = new Set();
+    const touch = (owner) => {
+      if (owner !== undefined && !seen.has(owner)) {
+        seen.add(owner);
+        touched.push({ owner, watermark: owner.watermark, checkedVersion: owner.checkedVersion, retired: [] });
+      }
+    };
+    for (const node of due) {
+      const lease = leases.get(node.token);
+      touch(resourceStates.get(lease.resource));
+      for (const quota of lease.chain) {
+        touch(quota);
+      }
+    }
+    for (const entry of touched) {
+      entry.retired = reconcile(entry.owner, now);
+    }
+    return touched;
+  }
+
+  function revertProjections(touched) {
+    for (const entry of touched) {
+      const { owner } = entry;
+      for (const item of entry.retired) {
+        const node = item.node ?? item;
+        owner.retired.delete(node.token);
+        if (item.revived) {
+          owner.live -= 1;
+        } else {
+          owner.live += 1;
+        }
+        owner.heap.push(node);
+      }
+      owner.watermark = entry.watermark;
+    }
+  }
+
+  function getSlots(resource) {
+    let set = slots.get(resource);
+    if (set === undefined) {
+      set = new Set();
+      slots.set(resource, set);
+    }
+    return set;
   }
 
   function addSlot(resource, token) {
-    getSlots(resource).push(token);
+    getSlots(resource).add(token);
   }
 
   function removeSlot(resource, token) {
-    const list = slots.get(resource);
-    if (list === undefined) {
+    const set = slots.get(resource);
+    if (set === undefined) {
       return false;
     }
-    const index = list.indexOf(token);
-    if (index === -1) {
-      return false;
-    }
-    list.splice(index, 1);
-    if (list.length === 0) {
+    const removed = set.delete(token);
+    if (removed && set.size === 0) {
       slots.delete(resource);
     }
-    return true;
+    return removed;
   }
 
-  // Drop expired-but-unswept credentials from a resource that is about to be
-  // granted: the resource is free, and a retaken lease must never be reported
-  // as reclaimed later. Mirrors the single-resource retake rule.
+  // Drop expired-but-unswept credentials from a single-occupancy resource
+  // that is about to be granted: the resource is free, and a retaken lease
+  // must never be reported as reclaimed later. Mirrors the retake rule. Share
+  // resources never displace anyone, so they never call this.
   function dropStaleSlots(resource, now) {
-    const list = slots.get(resource);
-    if (list === undefined) {
+    const rs = resourceStates.get(resource);
+    if (rs === undefined) {
       return;
     }
-    for (let i = list.length - 1; i >= 0; i -= 1) {
-      const token = list[i];
-      if (!isLive(leases.get(token), now)) {
+    // Permanent removal consults each owner's retired set itself and
+    // only decrements owners that were still counting the share, so no
+    // prior reconcile is needed here.
+    const set = slots.get(resource);
+    if (set === undefined) {
+      return;
+    }
+    for (const token of [...set]) {
+      const lease = leases.get(token);
+      if (!isLive(lease, now)) {
+        retirePermanent(lease);
         leases.delete(token);
-        list.splice(i, 1);
+        set.delete(token);
       }
     }
-    if (list.length === 0) {
+    if (set.size === 0) {
       slots.delete(resource);
     }
   }
 
-  function liveSlotCount(resource, now) {
-    const list = slots.get(resource);
-    if (list === undefined) {
-      return 0;
-    }
-    let live = 0;
-    for (const token of list) {
-      if (isLive(leases.get(token), now)) {
-        live += 1;
-      }
-    }
-    return live;
-  }
-
+  // Any live holder of a resource. Reconcile first retires every share due
+  // at the passed reading, so the heap top that still names a current lease
+  // is a live one; stale nodes (renewed, released, reclaimed) pop away.
+  // Work is O(expired * log n), never a scan of every share.
   function liveHolder(resource, now) {
-    const list = slots.get(resource);
-    if (list === undefined) {
-      return null;
-    }
-    for (const token of list) {
-      const lease = leases.get(token);
-      if (isLive(lease, now)) {
-        return lease.holder;
+    const rs = resourceStateFor(resource);
+    reconcile(rs, now);
+    while (rs.heap.size > 0) {
+      const node = rs.heap.peek();
+      const lease = leases.get(node.token);
+      if (lease === undefined || lease.heapSeq !== node.heapSeq) {
+        rs.heap.pop();
+        continue;
       }
+      return lease.holder;
     }
     return null;
   }
@@ -382,7 +679,7 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     if (logPath === null) {
       return;
     }
-    // One write for the whole batch: an operation that frees resources and
+    // One write for the whole batch: an operation that frees shares and
     // wakes requests either lands completely or not at all. Sequence ids are
     // numbered up front but only committed after the write lands, so a failed
     // append leaves both the log and the counter exactly as before.
@@ -408,17 +705,130 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     appendEvents([event]);
   }
 
+  // Declare a hierarchical quota node. The limit is the maximum number of
+  // shares that may be live at once under the node, counting every descendant
+  // level together. The parent (if any) must already be declared, so quota
+  // ids always form a forest and chains are captured once per grant.
+  function setQuota(quotaId, limit, parentId = undefined) {
+    if (quotaId === null || quotaId === undefined) {
+      throw new TypeError('quota id must not be null or undefined');
+    }
+    if (!Number.isInteger(limit) || limit <= 0) {
+      throw new TypeError('quota limit must be a positive integer');
+    }
+    // An explicitly named parent on an existing quota attempts to re-parent
+    // the node (a forest never allows); omitting the argument just updates
+    // the limit in place, so the existing parent is kept.
+    if (parentId !== null && parentId !== undefined && !quotas.has(parentId)) {
+      throw new TypeError(`unknown parent quota ${String(parentId)}`);
+    }
+    const existing = quotas.get(quotaId);
+    if (existing !== undefined) {
+      if (parentId !== undefined && parentId !== existing.parentId) {
+        throw new TypeError(`quota ${String(quotaId)} is already declared`);
+      }
+      const event = {
+        v: LOG_VERSION,
+        type: 'quota',
+        at: clock(),
+        quota: quotaId,
+        parent: existing.parentId,
+        limit,
+      };
+      appendEvent(event);
+      existing.limit = limit;
+      return;
+    }
+    if (parentId === quotaId) {
+      // A brand-new node cannot be its own parent.
+      throw new TypeError(`quota ${String(quotaId)} cannot parent itself`);
+    }
+
+    const event = {
+      v: LOG_VERSION,
+      type: 'quota',
+      at: clock(),
+      quota: quotaId,
+      parent: parentId ?? null,
+      limit,
+    };
+    appendEvent(event);
+    quotas.set(quotaId, {
+      id: quotaId,
+      parentId: parentId ?? null,
+      limit,
+      live: 0,
+      heap: new ExpiryQueue(),
+      resources: new Set(),
+      // Resources whose wait queue currently holds at least one request; a
+      // share freed anywhere under this quota seeds those queues' heads.
+      waitingResources: new Set(),
+      retired: new Map(),
+      watermark: -Infinity,
+      version: 0,
+      checkedVersion: -1,
+    });
+  }
+
+  // Declare a resource's share capacity and the quota leaf (if any) its
+  // shares count against. An undeclared resource behaves as capacity 1 with
+  // no quota.
+  function declareResource(resource, capacity, quotaId = null) {
+    if (!Number.isInteger(capacity) || capacity <= 0) {
+      throw new TypeError('capacity must be a positive integer');
+    }
+    let chain = [];
+    if (quotaId !== null && quotaId !== undefined) {
+      if (!quotas.has(quotaId)) {
+        throw new TypeError(`unknown quota ${String(quotaId)}`);
+      }
+      chain = quotaChainFor(quotaId);
+    }
+    const rs = resourceStateFor(resource);
+    if (rs.declared) {
+      throw new TypeError(`resource ${String(resource)} is already declared`);
+    }
+
+    const event = {
+      v: LOG_VERSION,
+      type: 'resource',
+      at: clock(),
+      resource,
+      capacity,
+      quota: quotaId ?? null,
+    };
+    appendEvent(event);
+
+    rs.declared = true;
+    rs.capacity = capacity;
+    rs.chain = chain;
+    for (const quota of chain) {
+      quota.resources.add(resource);
+    }
+  }
+
   function detachGroup(group) {
     for (const position of group.positions) {
       const queue = waitQueues.get(position.resource);
-      if (queue === undefined) {
-        continue;
+      if (queue !== undefined) {
+        const index = queue.indexOf(position);
+        if (index !== -1) {
+          queue.splice(index, 1);
+          if (queue.length === 0) {
+            waitQueues.delete(position.resource);
+          }
+        }
       }
-      const index = queue.indexOf(position);
-      if (index !== -1) {
-        queue.splice(index, 1);
-        if (queue.length === 0) {
-          waitQueues.delete(position.resource);
+      const rs = resourceStates.get(position.resource);
+      if (rs !== undefined) {
+        for (const quota of rs.chain) {
+          const refs = rs.waitRefs.get(quota) ?? 0;
+          if (refs <= 1) {
+            rs.waitRefs.delete(quota);
+            quota.waitingResources.delete(position.resource);
+          } else {
+            rs.waitRefs.set(quota, refs - 1);
+          }
         }
       }
     }
@@ -450,13 +860,14 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     }
   }
 
-  function enqueueGroup(resources, ttlList, holder, now, waitMs, single) {
+  function enqueueGroup(rows, ttlList, holder, now, waitMs, single) {
     requestSequence += 1;
     const requestId = `wait-${registryId}-${requestSequence}`;
+    const resources = rows.map((row) => row.resource);
     const ticket = single
       // Exact baseline shape for single-resource callers.
       ? { status: 'waiting', resource: resources[0], holder, waitId: requestId }
-      : { status: 'waiting', resources: [...resources], holder, waitId: requestId };
+      : { status: 'waiting', resources, holder, waitId: requestId };
     deadlineTie += 1;
     const deadlineNode = { requestId, deadline: now + waitMs, tie: deadlineTie, dead: false };
     const group = {
@@ -470,31 +881,48 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
       positions: [],
     };
     deadlineQueue.push(deadlineNode);
-    // One position per listed occurrence, pushed onto each resource's queue
-    // in the given order. Positions of one request land consecutively, so a
-    // repeated resource lines up as many times as it was listed.
-    resources.forEach((resource, index) => {
+    // One position per demand row, pushed onto each resource's queue in the
+    // given order. Each position claims `count` shares atomically.
+    rows.forEach((row, index) => {
       const position = {
         group,
-        resource,
+        resource: row.resource,
+        count: row.count,
         ttlMs: ttlList[index],
         granted: false,
-        token: null,
-        expiresAt: null,
+        tokens: [],
+        expiresAt: [],
       };
       group.positions.push(position);
-      let queue = waitQueues.get(resource);
+      let queue = waitQueues.get(row.resource);
       if (queue === undefined) {
         queue = [];
-        waitQueues.set(resource, queue);
+        waitQueues.set(row.resource, queue);
       }
       queue.push(position);
+
+      // Index this resource's queue under every quota of its chain, so a
+      // share freed anywhere under a quota can seed the head requests that
+      // quota alone was blocking.
+      const rs = resourceStateFor(row.resource);
+      for (const quota of rs.chain) {
+        const refs = rs.waitRefs.get(quota) ?? 0;
+        if (refs === 0) {
+          quota.waitingResources.add(row.resource);
+        }
+        rs.waitRefs.set(quota, refs + 1);
+      }
     });
     pendingGroups.set(requestId, group);
     return group;
   }
 
-  // Plan every grant one request needs (one per still-ungranted position),
+  function nextBatchId() {
+    batchSequence += 1;
+    return `batch-${registryId}-${batchSequence}`;
+  }
+
+  // Plan every grant one request needs (one credential per demanded share),
   // touching no state. The caller commits only after all events are on disk.
   // batchId ties the credentials of one atomic batch together for replay.
   function planGroupGrants(group, now, seqCursor) {
@@ -505,56 +933,72 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
       if (position.granted) {
         continue;
       }
-      const minted = mintToken(now, seq);
-      seq = minted.seq;
-      const expiresAt = now + position.ttlMs;
-      grants.push({
-        position,
-        group,
-        resource: position.resource,
-        holder: group.holder,
-        ttlMs: position.ttlMs,
-        token: minted.token,
-        seq: minted.seq,
-        expiresAt,
-        event: {
-          v: LOG_VERSION,
-          type: 'acquire',
-          at: now,
-          token: minted.token,
+      const chain = resourceStateFor(position.resource).chain;
+      for (let share = 0; share < position.count; share += 1) {
+        const minted = mintToken(now, seq);
+        seq = minted.seq;
+        const expiresAt = now + position.ttlMs;
+        grants.push({
+          position,
+          group,
           resource: position.resource,
           holder: group.holder,
           ttlMs: position.ttlMs,
+          token: minted.token,
+          seq: minted.seq,
           expiresAt,
-          requestId: group.requestId,
-          batch: batchId,
-        },
-      });
+          chain,
+          event: {
+            v: LOG_VERSION,
+            type: 'acquire',
+            at: now,
+            token: minted.token,
+            resource: position.resource,
+            holder: group.holder,
+            ttlMs: position.ttlMs,
+            expiresAt,
+            requestId: group.requestId,
+            batch: batchId,
+          },
+        });
+      }
     }
     return { group, grants, seq, batchId };
   }
 
+  function applyGrant(grant, batchId, now) {
+    tokenSequence = grant.seq;
+    knownTokens.add(grant.token);
+    const rs = resourceStateFor(grant.resource);
+    const lease = {
+      resource: grant.resource,
+      holder: grant.holder,
+      expiresAt: grant.expiresAt,
+      ttlMs: grant.ttlMs,
+      legacy: false,
+      heapSeq: 0,
+      batch: batchId,
+      chain: rs.chain,
+    };
+    leases.set(grant.token, lease);
+    if (rs.capacity === 1) {
+      dropStaleSlots(grant.resource, now);
+    }
+    addSlot(grant.resource, grant.token);
+    rs.live += 1;
+    for (const quota of rs.chain) {
+      quota.live += 1;
+    }
+    pushLeaseHeaps(grant.token, lease);
+    counters.granted += 1;
+
+    grant.position.tokens.push(grant.token);
+    grant.position.expiresAt.push(grant.expiresAt);
+  }
+
   function applyPlannedGrants(plan, now) {
     for (const grant of plan.grants) {
-      tokenSequence = grant.seq;
-      knownTokens.add(grant.token);
-      const lease = {
-        resource: grant.resource,
-        holder: grant.holder,
-        expiresAt: grant.expiresAt,
-        ttlMs: grant.ttlMs,
-        legacy: false,
-        heapSeq: 0,
-        batch: plan.batchId,
-      };
-      leases.set(grant.token, lease);
-      dropStaleSlots(grant.resource, now);
-      addSlot(grant.resource, grant.token);
-      enqueue(grant.token, lease);
-      counters.granted += 1;
-
-      grant.position.token = grant.token;
-      grant.position.expiresAt = grant.expiresAt;
+      applyGrant(grant, plan.batchId, now);
       grant.position.granted = true;
     }
 
@@ -563,19 +1007,24 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     const { ticket } = group;
     detachGroup(group);
     ticket.status = 'granted';
-    const granted = group.positions.map((position) => ({
-      resource: position.resource,
-      holder: group.holder,
-      token: position.token,
-      expiresAt: position.expiresAt,
-    }));
+    const granted = [];
+    for (const position of group.positions) {
+      for (let i = 0; i < position.tokens.length; i += 1) {
+        granted.push({
+          resource: position.resource,
+          holder: group.holder,
+          token: position.tokens[i],
+          expiresAt: position.expiresAt[i],
+        });
+      }
+    }
     if (group.single) {
       ticket.token = granted[0].token;
       ticket.expiresAt = granted[0].expiresAt;
     } else {
-      // One credential per listed occurrence, each with its own expiry.
+      // One credential per demanded share, each with its own expiry.
       ticket.leases = granted;
-      // Aliases for callers that read the batch outcome as a flat list.
+      // Alias for callers that read the batch outcome as a flat list.
       ticket.results = granted;
     }
   }
@@ -585,12 +1034,35 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
       plan.grants.some((grant) => grant.position === position));
   }
 
+  // Aggregate the share demand of one request: per resource and per quota,
+  // adding a position's count once for every quota its resource sits under.
+  function groupDemand(group) {
+    const byResource = new Map();
+    const byQuota = new Map();
+    for (const position of group.positions) {
+      if (position.granted) {
+        continue;
+      }
+      byResource.set(
+        position.resource,
+        (byResource.get(position.resource) ?? 0) + position.count,
+      );
+      const rs = resourceStates.get(position.resource);
+      for (const quota of rs.chain) {
+        byQuota.set(quota, (byQuota.get(quota) ?? 0) + position.count);
+      }
+    }
+    return { byResource, byQuota };
+  }
+
   // A queued request is fillable exactly when every position reaches the
-  // front of its resource's queue and that resource is free once the
-  // triggering event is applied. Only live credentials occupy: an expired
-  // but unswept lease is already gone, while a surviving twin of a released
-  // duplicate credential keeps the resource held.
-  function groupFillable(group, plans, freedLiveCount, now) {
+  // front of its resource's queue and the triggering event leaves enough
+  // free shares on the resource and on every quota level of its chain,
+  // counting shares other requests in this same cascade are about to take.
+  // Only live credentials occupy: an expired but unswept share is already
+  // gone, while a surviving share of a released duplicate credential keeps
+  // its quota occupied.
+  function groupFillable(group, plans, freedResources, freedQuotas, now) {
     for (const position of group.positions) {
       if (position.granted) {
         continue;
@@ -603,7 +1075,7 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
       for (let i = 0; i < index; i += 1) {
         const ahead = queue[i];
         if (ahead.group === group) {
-          // Own repeated listing: its positions are granted together.
+          // Own repeated row: its positions are granted together.
           continue;
         }
         if (positionPlanned(plans, ahead)) {
@@ -611,53 +1083,109 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
         }
         return false;
       }
-      // A release vacates a live credential; a sweep only removes leases
-      // that were already expired, so it frees no live occupancy here.
-      let occupied = Math.max(
-        0,
-        liveSlotCount(position.resource, now)
-          - (freedLiveCount.get(position.resource) ?? 0),
-      );
-      for (const plan of plans) {
-        if (plan.group === group) {
-          continue;
+    }
+
+    const demand = groupDemand(group);
+    for (const [resource, wanted] of demand.byResource) {
+      const rs = resourceStates.get(resource);
+      // Every owner is at the planning reading already (a release reconciles
+      // lazily first; a sweep projects the batch it is about to reclaim), so
+      // the projected occupancy is the current usage minus the shares this
+      // event vacates, plus what other requests in this cascade will take.
+      const occupied = rs.live - (freedResources.get(resource) ?? 0)
+        + plannedResourceUse(plans, group, (grant) => grant.resource === resource);
+      if (!rs.declared) {
+        // Single-occupancy resource.
+        if (occupied > 0) {
+          return false;
         }
-        for (const grant of plan.grants) {
-          if (grant.resource === position.resource) {
-            occupied += 1;
-          }
-        }
+        continue;
       }
-      if (occupied > 0) {
+      if (occupied + wanted > rs.capacity) {
+        return false;
+      }
+    }
+
+    // Quotas only ever sit above declared resources, so every chain check
+    // uses share arithmetic including this request's own demand.
+    for (const [quota, wanted] of demand.byQuota) {
+      const occupied = quota.live - (freedQuotas.get(quota) ?? 0)
+        + plannedResourceUse(plans, group, (grant) => grant.chain.includes(quota));
+      if (occupied + wanted > quota.limit) {
         return false;
       }
     }
     return true;
   }
 
-  // Grant every queued request whose resources become available through the
-  // given freeing event, cascading across resources and queues. Entries are
-  // { resource, live }: a release vacates a live credential, a reclaim only
-  // removes one that had already expired. Everything planned rides in the
-  // triggering log write.
-  //
-  // Only requests standing at the head of a queue touched by the event (plus
-  // the requests exposed behind a batch planned in this cascade) can possibly
-  // be fillable: a request was not fillable when it queued, and nothing else
-  // changed. Wake planning therefore never inspects requests waiting on
-  // unrelated resources, regardless of how many are queued in total.
-  function planWakeups(freedEntries, now) {
-    const freedLiveCount = new Map();
-    const touched = new Set();
-    for (const entry of freedEntries) {
-      touched.add(entry.resource);
-      if (entry.live) {
-        freedLiveCount.set(
-          entry.resource,
-          (freedLiveCount.get(entry.resource) ?? 0) + 1,
-        );
+  function plannedResourceUse(plans, selfGroup, matches) {
+    let use = 0;
+    for (const plan of plans) {
+      if (plan.group === selfGroup) {
+        continue;
+      }
+      for (const grant of plan.grants) {
+        if (matches(grant)) {
+          use += 1;
+        }
       }
     }
+    return use;
+  }
+
+  // Grant every queued request whose shares become available through the
+  // given freeing event, cascading across resources, quotas and queues.
+  // Entries are { token, resource, chain }: a release vacates live shares,
+  // and a sweep hands in the whole batch of globally due shares. In sweep
+  // mode the shares the owners have not lazily retired yet are projected out
+  // of each owner's usage, so a share retired at one level but still counted
+  // at another vacates room exactly where it was still occupying; a failed
+  // append then rolls the whole projection back.
+  //
+  // Only requests standing at the head of a queue touched by the event
+  // (directly, through a quota, or exposed behind a batch planned in this
+  // cascade) can possibly be fillable: a request was not fillable when it
+  // queued, and nothing else changed. Wake planning therefore never inspects
+  // requests waiting on unrelated resources, regardless of how many shares
+  // or waiters exist in total.
+  function planWakeups(freedEntries, now, sweepMode) {
+    const freedResources = new Map();
+    const freedQuotas = new Map();
+    const touchedResources = new Set();
+    const touchedQuotas = new Set();
+    for (const entry of freedEntries) {
+      touchedResources.add(entry.resource);
+      for (const quota of entry.chain) {
+        touchedQuotas.add(quota);
+      }
+    }
+    if (!sweepMode) {
+      // A release removes one live share; any other share due at the reading
+      // is already gone as well, so reconcile every owner whose room a
+      // candidate might ask about before testing the queues.
+      for (const resource of touchedResources) {
+        reconcile(resourceStates.get(resource), now);
+      }
+      for (const quota of touchedQuotas) {
+        reconcile(quota, now);
+      }
+    }
+    for (const entry of freedEntries) {
+      const rs = resourceStates.get(entry.resource);
+      const vacatesResource = !sweepMode || !rs.retired.has(entry.token);
+      if (vacatesResource) {
+        freedResources.set(
+          entry.resource,
+          (freedResources.get(entry.resource) ?? 0) + 1,
+        );
+      }
+      for (const quota of entry.chain) {
+        if (!sweepMode || !quota.retired.has(entry.token)) {
+          freedQuotas.set(quota, (freedQuotas.get(quota) ?? 0) + 1);
+        }
+      }
+    }
+
     const plans = [];
     const planned = new Set();
     const candidates = new Set();
@@ -667,9 +1195,27 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
         candidates.add(queue[0].group);
       }
     };
-    for (const resource of touched) {
+    for (const resource of touchedResources) {
       seedHead(resource);
     }
+    // A share freed on one resource can fund a head request on a different
+    // resource that only lacked room on a shared ancestor quota. Such a head
+    // still needs spare local capacity (this event freed nothing there, and
+    // only shares due in this sweep can leave silently), so fully packed
+    // queues are never added as candidates: seeding work stays proportional
+    // to queues the freed quota room could actually unblock.
+    for (const quota of touchedQuotas) {
+      for (const resource of quota.waitingResources) {
+        const rs = resourceStates.get(resource);
+        if (rs !== undefined) {
+          if (rs.live - (freedResources.get(resource) ?? 0) >= rs.capacity) {
+            continue;
+          }
+        }
+        seedHead(resource);
+      }
+    }
+
     let seq = tokenSequence;
     for (;;) {
       // Candidates are picked strictly by arrival order: the earliest
@@ -680,7 +1226,7 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
         if (planned.has(group)) {
           continue;
         }
-        if (!groupFillable(group, plans, freedLiveCount, now)) {
+        if (!groupFillable(group, plans, freedResources, freedQuotas, now)) {
           continue;
         }
         if (next === null || group.arrival < next.arrival) {
@@ -714,57 +1260,158 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     return plans;
   }
 
-  function nextBatchId() {
-    batchSequence += 1;
-    return `batch-${registryId}-${batchSequence}`;
-  }
-
-  // Resolve the ttl argument into one positive finite ttl per occurrence.
-  function resolveTtls(resources, ttlMs) {
-    if (ttlMs === undefined) {
-      return resources.map(() => defaultTtlMs);
+  // Resolve the ttl argument into one positive finite ttl per demand row.
+  function resolveTtls(rows, ttlMsValue) {
+    if (ttlMsValue === undefined) {
+      return rows.map(() => defaultTtlMs);
     }
-    if (Array.isArray(ttlMs)) {
-      if (ttlMs.length !== resources.length) {
+    if (Array.isArray(ttlMsValue)) {
+      if (ttlMsValue.length !== rows.length) {
         throw new TypeError('ttlMs must match the resources list length');
       }
-      return ttlMs.map((value) => {
+      return ttlMsValue.map((value) => {
         if (!Number.isFinite(value) || value <= 0) {
           throw new TypeError('ttlMs must be a positive finite number');
         }
         return value;
       });
     }
-    if (!Number.isFinite(ttlMs) || ttlMs <= 0) {
+    if (!Number.isFinite(ttlMsValue) || ttlMsValue <= 0) {
       throw new TypeError('ttlMs must be a positive finite number');
     }
-    return resources.map(() => ttlMs);
+    return rows.map(() => ttlMsValue);
   }
 
-  // Persist and commit one credential per listed occurrence, all in a single
-  // log write. A failed write leaves every resource exactly as before.
-  function commitDirectGrants(resources, ttlList, holder, now) {
+  // Normalize group input into one { resource, count } row per entry. A bare
+  // resource value asks for one share; { resource, count } asks for several
+  // shares of the same resource in one atomic request.
+  function normalizeRows(entries) {
+    if (!Array.isArray(entries) || entries.length === 0) {
+      throw new TypeError('resources must be a non-empty array');
+    }
+    return entries.map((entry) => {
+      if (entry !== null && typeof entry === 'object' && !Array.isArray(entry)) {
+        if (entry.resource === null || entry.resource === undefined) {
+          throw new TypeError('each resource entry needs a resource');
+        }
+        if (!Number.isInteger(entry.count) || entry.count <= 0) {
+          throw new TypeError('share count must be a positive integer');
+        }
+        return { resource: entry.resource, count: entry.count };
+      }
+      return { resource: entry, count: 1 };
+    });
+  }
+
+  // Check a direct (non-queued) request against every capacity and quota
+  // level. Returns null when every demanded share fits, otherwise a descriptor
+  // of the first constraint that blocks it.
+  function directBlocker(rows, now) {
+    for (const row of rows) {
+      if (waitQueues.has(row.resource)) {
+        return { kind: 'taken', resource: row.resource };
+      }
+    }
+    // Declared (share) resources reconcile lazily at this observation:
+    // an expired share vacates capacity and quota room before the
+    // request is checked. An undeclared single-occupancy resource is
+    // tested non-mutatingly below instead - its stale credentials are
+    // displaced structurally by the grant's own dropStaleSlots, and
+    // mutating owner state in this pre-check would move the stale share
+    // twice.
+    for (const row of rows) {
+      const rs = resourceStates.get(row.resource);
+      if (rs !== undefined && rs.declared) {
+        reconcile(rs, now);
+      }
+    }
+    const wantedByResource = new Map();
+    for (const row of rows) {
+      wantedByResource.set(
+        row.resource,
+        (wantedByResource.get(row.resource) ?? 0) + row.count,
+      );
+    }
+    for (const [resource, wanted] of wantedByResource) {
+      const rs = resourceStates.get(resource) ?? resourceStateFor(resource);
+      if (!rs.declared) {
+        // Single-occupancy resource: the request's own repeated rows stack
+        // freely, so any live third-party credential blocks it outright.
+        // Liveness is read off the heap without mutating owner state;
+        // dropStaleSlots handles a structural displacement instead.
+        if (hasLiveHeapNode(rs, now)) {
+          return { kind: 'taken', resource, available: 0, requested: wanted };
+        }
+        continue;
+      }
+      if (rs.live + wanted > rs.capacity) {
+        return {
+          kind: 'taken',
+          resource,
+          available: rs.capacity - rs.live,
+          requested: wanted,
+        };
+      }
+    }
+    const wantedByQuota = new Map();
+    const quotaOrder = [];
+    for (const row of rows) {
+      const rs = resourceStates.get(row.resource);
+      for (const quota of rs.chain) {
+        if (!wantedByQuota.has(quota)) {
+          wantedByQuota.set(quota, 0);
+          quotaOrder.push(quota);
+        }
+        wantedByQuota.set(quota, wantedByQuota.get(quota) + row.count);
+      }
+    }
+    for (const quota of quotaOrder) {
+      reconcile(quota, now);
+      const wanted = wantedByQuota.get(quota);
+      if (quota.live + wanted > quota.limit) {
+        return {
+          kind: 'quota',
+          quota: quota.id,
+          available: quota.limit - quota.live,
+          requested: wanted,
+        };
+      }
+    }
+    return null;
+  }
+
+  // Persist and commit one credential per demanded share, all in a single log
+  // write. A failed write leaves every resource and quota exactly as before.
+  function commitDirectGrants(rows, ttlList, holder, now) {
     const batchId = nextBatchId();
     const events = [];
     const grants = [];
     let seq = tokenSequence;
-    resources.forEach((resource, index) => {
-      const ttlMsValue = ttlList[index];
-      const minted = mintToken(now, seq);
-      seq = minted.seq;
-      const expiresAt = now + ttlMsValue;
-      events.push({
-        v: LOG_VERSION,
-        type: 'acquire',
-        at: now,
-        token: minted.token,
-        resource,
-        holder,
-        ttlMs: ttlMsValue,
-        expiresAt,
-        batch: batchId,
-      });
-      grants.push({ resource, ttlMs: ttlMsValue, token: minted.token, expiresAt });
+    rows.forEach((row, index) => {
+      for (let share = 0; share < row.count; share += 1) {
+        const ttlMsValue = ttlList[index];
+        const minted = mintToken(now, seq);
+        seq = minted.seq;
+        const expiresAt = now + ttlMsValue;
+        events.push({
+          v: LOG_VERSION,
+          type: 'acquire',
+          at: now,
+          token: minted.token,
+          resource: row.resource,
+          holder,
+          ttlMs: ttlMsValue,
+          expiresAt,
+          batch: batchId,
+        });
+        grants.push({
+          resource: row.resource,
+          ttlMs: ttlMsValue,
+          token: minted.token,
+          expiresAt,
+          seq: minted.seq,
+        });
+      }
     });
     appendEvents(events);
 
@@ -772,6 +1419,7 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     const result = [];
     for (const grant of grants) {
       knownTokens.add(grant.token);
+      const rs = resourceStateFor(grant.resource);
       const lease = {
         resource: grant.resource,
         holder,
@@ -780,11 +1428,18 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
         legacy: false,
         heapSeq: 0,
         batch: batchId,
-      };
+        chain: rs.chain,
+        };
       leases.set(grant.token, lease);
-      dropStaleSlots(grant.resource, now);
+      if (rs.capacity === 1) {
+        dropStaleSlots(grant.resource, now);
+      }
       addSlot(grant.resource, grant.token);
-      enqueue(grant.token, lease);
+      rs.live += 1;
+      for (const quota of rs.chain) {
+        quota.live += 1;
+      }
+      pushLeaseHeaps(grant.token, lease);
       counters.granted += 1;
       result.push({
         resource: grant.resource,
@@ -796,40 +1451,37 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     return result;
   }
 
-  // Atomic multi-resource acquisition. Every listed occurrence gets its own
-  // credential and independent expiry; either all of them are held, or none
-  // are (the whole request queues instead). ttlMs may be one number or one
-  // ttl per listed resource.
-  function acquireAll(resources, holder, ttlMs = undefined, waitMs = undefined) {
-    if (!Array.isArray(resources) || resources.length === 0) {
-      throw new TypeError('resources must be a non-empty array');
-    }
-    const ttlList = resolveTtls(resources, ttlMs);
+  // Atomic multi-resource, multi-share acquisition. Every demanded share
+  // gets its own credential and independent expiry; either all of them are
+  // held, or none are (the whole request queues instead). ttlMs may be one
+  // number or one ttl per demand row.
+  function acquireAll(entries, holder, ttlMs = undefined, waitMs = undefined) {
+    const rows = normalizeRows(entries);
+    const ttlList = resolveTtls(rows, ttlMs);
     const wantsWait = validateWait(waitMs);
     const now = clock();
     purgeExpiredWaiters(now);
 
-    // Earlier waiters keep their place, and any live lease on a listed
-    // resource blocks the whole batch; a resource listed twice is free for
-    // this request only when it is not held at all.
-    let conflict = null;
-    for (const resource of resources) {
-      if (waitQueues.has(resource) || liveSlotCount(resource, now) > 0) {
-        conflict = resource;
-        break;
-      }
-    }
+    // Earlier waiters keep their place; beyond that every capacity and every
+    // quota level must have room for the whole demand at once.
+    const blocker = directBlocker(rows, now);
 
-    if (conflict !== null) {
+    if (blocker !== null) {
       if (!wantsWait) {
-        throw new LeaseTakenError(conflict, liveHolder(conflict, now));
+        if (blocker.kind === 'quota') {
+          throw new QuotaExceededError(
+            blocker.quota, holder, blocker.requested, blocker.available,
+          );
+        }
+        throw new LeaseTakenError(
+          blocker.resource, liveHolder(blocker.resource, now),
+          blocker.requested, blocker.available,
+        );
       }
-      return enqueueGroup(
-        resources, ttlList, holder, now, waitMs, false,
-      ).ticket;
+      return enqueueGroup(rows, ttlList, holder, now, waitMs, false).ticket;
     }
 
-    return commitDirectGrants(resources, ttlList, holder, now);
+    return commitDirectGrants(rows, ttlList, holder, now);
   }
 
   function validateWait(waitMs) {
@@ -854,19 +1506,29 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     const now = clock();
     purgeExpiredWaiters(now);
 
-    if (liveSlotCount(resource, now) > 0 || waitQueues.has(resource)) {
+    const rows = [{ resource, count: 1 }];
+    const blocker = directBlocker(rows, now);
+    if (blocker !== null) {
       if (!wantsWait) {
-        throw new LeaseTakenError(resource, liveHolder(resource, now));
+        if (blocker.kind === 'quota') {
+          throw new QuotaExceededError(
+            blocker.quota, holder, blocker.requested, blocker.available,
+          );
+        }
+        throw new LeaseTakenError(
+          resource, liveHolder(resource, now),
+          blocker.requested, blocker.available,
+        );
       }
-      // Occupied or reserved: take a place in line instead of throwing. The
-      // resource does not change hands just because a waiter showed up.
+      // Occupied or reserved: take a place in line instead of throwing. No
+      // share changes hands just because a waiter showed up.
       return enqueueGroup(
-        [resource], [effectiveTtl], holder, now, waitMs, true,
+        rows, [effectiveTtl], holder, now, waitMs, true,
       ).ticket;
     }
 
     const [granted] = commitDirectGrants(
-      [resource], [effectiveTtl], holder, now,
+      rows, [effectiveTtl], holder, now,
     );
     return granted;
   }
@@ -877,6 +1539,14 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
       return false;
     }
     const now = clock();
+    // Bring every owner of this share to the passed reading first: a clock
+    // that moved backwards may have revived the share, and liveness must be
+    // judged from the reading as given.
+    const rs = resourceStates.get(lease.resource);
+    reconcile(rs, now);
+    for (const quota of lease.chain) {
+      reconcile(quota, now);
+    }
     if (lease.expiresAt <= now) {
       return false;
     }
@@ -886,7 +1556,7 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
 
     lease.expiresAt = expiresAt;
     lease.heapSeq += 1;
-    enqueue(token, lease);
+    pushLeaseHeaps(token, lease);
     counters.renewed += 1;
     return true;
   }
@@ -902,11 +1572,13 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     }
     purgeExpiredWaiters(now);
 
-    // The freed resource goes to the requests at the head of its queue; a
-    // group only wakes when every copy it needs is free. All wakeup grants
-    // ride in the same write as the release, so a failed log leaves the lease
-    // and every queue untouched.
-    const plans = planWakeups([{ resource: lease.resource, live: true }], now);
+    // The freed shares go to the requests at the heads of the queues, on the
+    // resource and up every quota level; a group only wakes when every share
+    // it asked for is free. All wakeup grants ride in the same write as the
+    // release, so a failed log leaves the lease and every queue untouched.
+    const plans = planWakeups(
+      [{ token, resource: lease.resource, chain: lease.chain }], now, false,
+    );
     const events = [{ v: LOG_VERSION, type: 'release', at: now, token }];
     for (const plan of plans) {
       for (const grant of plan.grants) {
@@ -915,7 +1587,8 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     }
     appendEvents(events);
 
-    // The record comes off immediately; its queued node retires lazily.
+    // The record comes off permanently; its expiry nodes retire lazily.
+    retirePermanent(lease);
     leases.delete(token);
     removeSlot(lease.resource, token);
     counters.released += 1;
@@ -960,27 +1633,38 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     }
 
     // Every due node still carries the current lease record (retired nodes
-    // were filtered above) and a current lease always occupies its resource.
-    const reclaimable = due;
-
-    // Reclaimed resources are handed to the head requests of their queues in
-    // the same expiry order the reclaim happens; every wakeup grant rides
-    // along in the same log write, so a failed append rolls everything back.
+    // were filtered above) and a current lease still occupies a slot. The
+    // wake planner projects each such share out of every owner that has not
+    // lazily retired it yet (checked through the owner's retired set), so a
+    // share can fund room at one level while still occupying another.
+    const reclaimItems = due.map((node) => {
+      const lease = leases.get(node.token);
+      return {
+        token: node.token,
+        resource: lease.resource,
+        chain: lease.chain,
+      };
+    });
     const events = [{
       v: LOG_VERSION,
       type: 'reclaim',
       at: now,
-      items: reclaimable.map((node) => ({
-        token: node.token,
-        resource: leases.get(node.token).resource,
-      })),
+      items: reclaimItems.map(({ token, resource }) => ({ token, resource })),
     }];
+    // Project the due shares through every resource and quota owner
+    // before planning wakes: the sweep is a single committed operation, so
+    // wake planning sees the reclaimed room at every level even though the
+    // reclaim lands with the log write below. Every owner is reconciled to
+    // the sweep reading; a later observation at the same reading is a
+    // no-op, and a backwards reading revives owners that the sweep itself
+    // never reclaimed.
+    const projected = projectReclaims(due, now);
     const plans = planWakeups(
-      reclaimable.map((node) => ({
-        resource: leases.get(node.token).resource,
-        live: false,
+      reclaimItems.map(({ token, resource, chain }) => ({
+        token, resource, chain,
       })),
       now,
+      true,
     );
     for (const plan of plans) {
       for (const grant of plan.grants) {
@@ -991,8 +1675,10 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     try {
       appendEvents(events);
     } catch (error) {
-      // The write never happened: put the popped nodes back so the queue is
-      // byte-for-byte the same as before the call.
+      // The write never happened: put the popped global nodes back and
+      // undo every projected retirement, so the registry is byte-for-byte
+      // and figure-for-figure the same as before the call.
+      revertProjections(projected);
       for (const node of due) {
         expiryQueue.push(node);
       }
@@ -1000,8 +1686,12 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     }
 
     const freed = [];
-    for (const node of reclaimable) {
+    for (const node of due) {
       const lease = leases.get(node.token);
+      // The global reclaim is committed. Usage was projected out of every
+      // owner before the write, so here the share is only forgotten from
+      // retired sets and the table; no owner moves usage a second time.
+      purgeRetired(lease);
       leases.delete(node.token);
       if (removeSlot(lease.resource, node.token)) {
         counters.reclaimed += 1;
@@ -1021,15 +1711,23 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
   }
 
   function stats() {
-    let live = 0;
     const now = clock();
     purgeExpiredWaiters(now);
-    for (const list of slots.values()) {
-      for (const token of list) {
-        if (isLive(leases.get(token), now)) {
-          live += 1;
-        }
-      }
+    // Reconcile each resource owner independently: work is proportional to
+    // the shares actually due since the last observation plus the number
+    // of distinct resources, never to the total number of live shares.
+    // Quota usage follows the same reconciliation lazily through acquires,
+    // releases and sweeps.
+    let live = 0;
+    for (const rs of resourceStates.values()) {
+      reconcile(rs, now);
+      live += rs.live;
+    }
+    // Resource reconciliation retires a share at the resource only; every
+    // quota level is an independent owner and must observe the reading too,
+    // so an expired share vacates ancestor room at this observation.
+    for (const quota of quotas.values()) {
+      reconcile(quota, now);
     }
     return {
       granted: counters.granted,
@@ -1099,6 +1797,23 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     for (const entry of leaseEntries) {
       delete entry.order;
     }
+
+    // Quota forest and resource declarations come first in the image so the
+    // leases below can be attached to reconstructed chains; per-level quota
+    // occupation is rebuilt from the lease entries themselves, so the usage
+    // figures can never disagree with the shares they count.
+    const quotaEntries = [];
+    for (const [id, quota] of quotas.entries()) {
+      quotaEntries.push({ quota: id, parent: quota.parentId, limit: quota.limit });
+    }
+    const resourceEntries = [];
+    for (const [resource, rs] of resourceStates.entries()) {
+      if (rs.declared) {
+        const leaf = rs.chain.length === 0 ? null : rs.chain[rs.chain.length - 1].id;
+        resourceEntries.push({ resource, capacity: rs.capacity, quota: leaf });
+      }
+    }
+
     const snapshot = {
       v: SNAPSHOT_VERSION,
       type: 'snapshot',
@@ -1107,6 +1822,8 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
       tokenSeq: tokenSequence,
       batchSeq: batchSequence,
       counters: { ...counters },
+      quotas: quotaEntries,
+      resources: resourceEntries,
       leases: leaseEntries,
     };
 
@@ -1154,6 +1871,8 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     acquireAll,
     acquireGroup: acquireAll,
     acquireMany: acquireAll,
+    declareResource,
+    setQuota,
     renew,
     release,
     sweep,
@@ -1162,6 +1881,37 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     cancel,
     compact,
   };
+
+  function applyReplayQuota(entry) {
+    const existing = quotas.get(entry.quota);
+    if (existing === undefined) {
+      quotas.set(entry.quota, {
+        id: entry.quota,
+        parentId: entry.parent,
+        limit: entry.limit,
+        live: 0,
+        heap: new ExpiryQueue(),
+        resources: new Set(),
+        waitingResources: new Set(),
+        retired: new Map(),
+        watermark: -Infinity,
+        version: 0,
+        checkedVersion: -1,
+      });
+    } else {
+      existing.limit = entry.limit;
+    }
+  }
+
+  function applyReplayResource(entry) {
+    const rs = resourceStateFor(entry.resource);
+    rs.declared = true;
+    rs.capacity = entry.capacity;
+    rs.chain = entry.quota === null ? [] : quotaChainFor(entry.quota);
+    for (const quota of rs.chain) {
+      quota.resources.add(entry.resource);
+    }
+  }
 
   function load() {
     if (logPath === null) {
@@ -1325,7 +2075,9 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
         (!Number.isInteger(value.tokenSeq) || value.tokenSeq < 0)) ||
       !Number.isFinite(value.at) ||
       (value.batchSeq !== undefined &&
-        (!Number.isInteger(value.batchSeq) || value.batchSeq < 0))
+        (!Number.isInteger(value.batchSeq) || value.batchSeq < 0)) ||
+      (value.quotas !== undefined && !Array.isArray(value.quotas)) ||
+      (value.resources !== undefined && !Array.isArray(value.resources))
     ) {
       throw new LogFileError(`corrupt lease snapshot at ${snapshotPath}`);
     }
@@ -1333,6 +2085,49 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     for (const key of ['granted', 'renewed', 'released', 'reclaimed']) {
       if (!Number.isFinite(value.counters[key])) {
         throw new LogFileError(`corrupt lease snapshot counters at ${snapshotPath}`);
+      }
+    }
+    if (value.quotas !== undefined) {
+      const quotaIds = new Set();
+      for (const entry of value.quotas) {
+        if (
+          entry === null ||
+          typeof entry !== 'object' ||
+          entry.quota === null || entry.quota === undefined ||
+          (entry.parent !== null && entry.parent === undefined) ||
+          !Number.isInteger(entry.limit) || entry.limit <= 0
+        ) {
+          throw new LogFileError(`corrupt lease snapshot quota at ${snapshotPath}`);
+        }
+        if (quotaIds.has(entry.quota)) {
+          throw new LogFileError(`duplicate quota in snapshot at ${snapshotPath}`);
+        }
+        quotaIds.add(entry.quota);
+      }
+      // The quota forest has to be reconstructable: every parent must be
+      // named in the same image, otherwise a chain could not be rebuilt.
+      for (const entry of value.quotas) {
+        if (entry.parent !== null && !quotaIds.has(entry.parent)) {
+          throw new LogFileError(
+            `snapshot quota with unknown parent at ${snapshotPath}`,
+          );
+        }
+      }
+    }
+    if (value.resources !== undefined) {
+      for (const entry of value.resources) {
+        if (
+          entry === null ||
+          typeof entry !== 'object' ||
+          entry.resource === null || entry.resource === undefined ||
+          !Number.isInteger(entry.capacity) || entry.capacity <= 0 ||
+          (entry.quota !== null && entry.quota === undefined) ||
+          (value.quotas !== undefined &&
+            entry.quota !== null &&
+            !value.quotas.some((quota) => quota.quota === entry.quota))
+        ) {
+          throw new LogFileError(`corrupt lease snapshot resource at ${snapshotPath}`);
+        }
       }
     }
     for (const entry of value.leases) {
@@ -1358,23 +2153,39 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     replayMaxEventSeq = snapshot.seq;
     replayMaxTokenSeq = snapshot.tokenSeq ?? 0;
     replayMaxBatchSeq = snapshot.batchSeq ?? 0;
+
+    // Configuration first: each lease below hooks into the reconstructed
+    // quota chains and rebuilds per-level occupation as its shares are added.
+    for (const entry of snapshot.quotas ?? []) {
+      applyReplayQuota(entry);
+    }
+    for (const entry of snapshot.resources ?? []) {
+      applyReplayResource(entry);
+    }
+
     for (const entry of snapshot.leases) {
+      const rs = resourceStates.get(entry.resource) ?? resourceStateFor(entry.resource);
       const lease = {
         resource: entry.resource,
         holder: entry.holder,
         expiresAt: entry.expiresAt,
         ttlMs: entry.ttlMs,
         // Credentials captured before this process started are void: the
-        // lease keeps occupying the resource, but its token cannot renew or
-        // release it.
+        // lease keeps occupying its shares, but its token cannot renew or
+        // release them.
         legacy: true,
         heapSeq: 0,
         batch: entry.batch ?? null,
-      };
+        chain: rs.chain,
+        };
       leases.set(entry.token, lease);
       addSlot(entry.resource, entry.token);
       knownTokens.add(entry.token);
-      enqueue(entry.token, lease);
+      rs.live += 1;
+      for (const quota of rs.chain) {
+        quota.live += 1;
+      }
+      pushLeaseHeaps(entry.token, lease);
     }
   }
 
@@ -1429,6 +2240,51 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     }
 
     switch (event.type) {
+      case 'quota': {
+        if (
+          event.quota === null || event.quota === undefined ||
+          (event.parent !== null && event.parent === undefined) ||
+          !Number.isInteger(event.limit) || event.limit <= 0
+        ) {
+          throw new LogFileError(
+            `corrupt quota entry on line ${lineNumber} of ${logPath}`,
+          );
+        }
+        if (event.parent === event.quota) {
+          throw new LogFileError(
+            `quota entry parenting itself on line ${lineNumber} of ${logPath}`,
+          );
+        }
+        if (event.parent !== null && !quotas.has(event.parent)) {
+          throw new LogFileError(
+            `quota entry with unknown parent on line ${lineNumber} of ${logPath}`,
+          );
+        }
+        applyReplayQuota({ quota: event.quota, parent: event.parent, limit: event.limit });
+        break;
+      }
+      case 'resource': {
+        if (
+          event.resource === null || event.resource === undefined ||
+          !Number.isInteger(event.capacity) || event.capacity <= 0 ||
+          (event.quota !== null && event.quota === undefined)
+        ) {
+          throw new LogFileError(
+            `corrupt resource entry on line ${lineNumber} of ${logPath}`,
+          );
+        }
+        if (event.quota !== null && !quotas.has(event.quota)) {
+          throw new LogFileError(
+            `resource entry with unknown quota on line ${lineNumber} of ${logPath}`,
+          );
+        }
+        applyReplayResource({
+          resource: event.resource,
+          capacity: event.capacity,
+          quota: event.quota ?? null,
+        });
+        break;
+      }
       case 'acquire': {
         if (
           typeof event.token !== 'string' ||
@@ -1440,8 +2296,10 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
           );
         }
         // Credentials minted together for one atomic batch superseded any
-        // expired, unswept lease on the resource as one unit: only slots held
-        // by a different batch count as the stale lease being retaken.
+        // expired, unswept lease on a single-occupancy resource as one unit:
+        // only slots held by a different batch count as the stale lease being
+        // retaken. Share resources keep every coexisting credential.
+        const rs = resourceStateFor(event.resource);
         if (event.batch !== undefined && event.batch !== null) {
           const logged = /^batch-[^-]+-(\d+)$/.exec(String(event.batch));
           if (logged !== null) {
@@ -1458,12 +2316,29 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
           replayBatchId = null;
           replayBatchTokens = new Set();
         }
-        const occupantTokens = slots.get(event.resource);
-        if (occupantTokens !== undefined) {
-          for (const oldToken of [...occupantTokens]) {
-            if (!replayBatchTokens.has(oldToken)) {
-              leases.delete(oldToken);
-              removeSlot(event.resource, oldToken);
+        if (rs.capacity === 1) {
+          const occupantTokens = slots.get(event.resource);
+          if (occupantTokens !== undefined) {
+            for (const oldToken of [...occupantTokens]) {
+              if (!replayBatchTokens.has(oldToken)) {
+                const oldLease = leases.get(oldToken);
+                // Structural supersede, exactly like an in-process
+                // retake: vacate the slot and the table. The stale
+                // heap node is dropped right away from every owner
+                // heap, so the reconstructed table never observes a
+                // share it never held, even before the batch's
+                // reclaim event (if any) is replayed.
+                if (oldLease !== undefined) {
+                  const oldRs = resourceStates.get(oldLease.resource);
+                  removeHeapNodes(oldRs.heap, oldToken);
+                  for (const q of oldLease.chain) {
+                    removeHeapNodes(q.heap, oldToken);
+                  }
+                }
+                retirePermanent(oldLease);
+                leases.delete(oldToken);
+                removeSlot(event.resource, oldToken);
+              }
             }
           }
         }
@@ -1473,17 +2348,22 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
           expiresAt: event.expiresAt,
           ttlMs: event.ttlMs,
           // Credentials issued before this process started are void: the
-          // lease keeps occupying the resource, but its token cannot
-          // renew or release it.
+          // lease keeps occupying its shares, but its token cannot renew or
+          // release them.
           legacy: true,
           heapSeq: 0,
           batch: event.batch ?? null,
-        };
+          chain: rs.chain,
+            };
         leases.set(event.token, lease);
         addSlot(event.resource, event.token);
         replayBatchTokens.add(event.token);
         knownTokens.add(event.token);
-        enqueue(event.token, lease);
+        rs.live += 1;
+        for (const quota of rs.chain) {
+          quota.live += 1;
+        }
+        pushLeaseHeaps(event.token, lease);
         counters.granted += 1;
         break;
       }
@@ -1500,7 +2380,7 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
         if (lease !== undefined) {
           lease.expiresAt = event.expiresAt;
           lease.heapSeq += 1;
-          enqueue(event.token, lease);
+          pushLeaseHeaps(event.token, lease);
         }
         counters.renewed += 1;
         break;
@@ -1513,6 +2393,7 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
         }
         const lease = leases.get(event.token);
         if (lease !== undefined) {
+          retirePermanent(lease);
           leases.delete(event.token);
           removeSlot(lease.resource, event.token);
         }
@@ -1535,6 +2416,7 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
           const token = item.token;
           const lease = leases.get(token);
           if (lease !== undefined) {
+            retirePermanent(lease);
             leases.delete(token);
             removeSlot(lease.resource, token);
           }

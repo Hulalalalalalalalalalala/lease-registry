@@ -22,7 +22,10 @@ Node.js 20 or newer. No runtime dependencies.
   form, identical to `acquireAll`.
 - `Registry.acquireAll(resources, holder, ttlMs, waitMs)` (aliases
   `acquireGroup`, `acquireMany`) acquires several resources atomically; see
-  "Atomic groups" below.
+  "Atomic groups" below. Each entry may be a bare resource string
+  (one share) or `{ resource, count }` asking for several shares of
+  one resource in one atomic request; see "Shareable resources and
+  hierarchical quotas" below.
 - `Registry.renew(token) -> boolean` extends a lease that is still live.
 - `Registry.release(token) -> boolean` ends a lease early.
 - `Registry.sweep(now) -> string[]` reclaims expired leases and names the resources it freed, ordered by expiry time.
@@ -31,7 +34,15 @@ Node.js 20 or newer. No runtime dependencies.
 - `Registry.cancel(waitId) -> boolean` withdraws a still queued request.
 - `Registry.compact(now) -> { seq, leases }` folds the whole history into a
   crash-safe snapshot and restarts the event log from that point.
+- `Registry.declareResource(resource, capacity, quotaId = null)` registers a
+  resource's share capacity before its resources are applied for; see
+  "Shareable resources and hierarchical quotas" below.
+- `Registry.setQuota(quotaId, limit, parentId)` registers a
+  quota node or changes an existing node's limit; see below.
 - `LeaseTakenError` exported class carrying a `code` property.
+- `QuotaExceededError` exported class carrying a `code` property
+  (`'QUOTA_EXCEEDED'`), plus `quota`, `holder`, `requested` and
+  `available` fields.
 - `LogFileError` exported class carrying a `code` property (`'LOG_FILE_ERROR'`).
 
 ### Atomic groups
@@ -150,10 +161,68 @@ observable behaviour is unchanged.
 
     npm test
 
-## Limits
 
-Single process only; no distributed coordination.
-Time comes from the injected clock and does not advance on its own; clock
-readings going backwards are taken as given. Persistence is an append-only
-file replayed by one process at a time, not shared storage across processes
-or machines.
+
+## Shareable resources and hierarchical quotas
+
+By default every resource is exclusive and single-occupancy, exactly as
+above. A resource can instead be registered as a shareable pool with a
+finite capacity before any of its shares are applied for:
+
+    registry.declareResource(resource, capacity)
+    registry.declareResource(resource, capacity, quotaId = null)
+
+`declareResource` is the only way to mark a resource as shareable;
+its name and positive-integer capacity must be registered before the first
+acquire on it. Undeclared resources keep the single-occupancy behavior
+forever; an undeclared resource used by an acquire still behaves as the
+exclusive resource even when it has never been declared before.
+
+On a shareable resource an acquire asks for one or more of its shares.
+Each share gets its own credential and its own absolute expiry; several
+holders may occupy the resource at once, and a released or reclaimed share is
+immediately grantable again. A holder taking several shares at once uses the
+multi-share group form:
+
+    registry.declareResource('pool', 4)
+    const leases = registry.acquire('pool', 'a', 50, undefined, 2)
+
+`acquireAll` entries can demand several shares by giving
+`{ resource, count }` rows:
+
+    registry.acquireAll([{ resource: 'pool', count: 3 }], 'h', 50)
+
+Every demanded share succeeds as one atomic grant in a single log write: the
+whole request either holds every share or none of them. A demand larger
+than the resource's capacity throws `LeaseTakenError` carrying
+`requested` and `available` and leaves nothing behind.
+
+### Hierarchical quotas
+
+Quota nodes form a forest:
+
+    registry.setQuota('root', 6)
+    registry.setQuota('east', 3, 'root')
+    registry.setQuota('east-db', 1, 'east')
+    registry.declareResource('zone/a', 10, 'east-db')
+
+A quota bounds the total number of shares that may be live under the node
+at once, counting every descendant share together no matter who holds
+them. A parent must be registered before its child; the forest order
+can be declared: `setQuota(id, limit)` or
+`setQuota(id, limit, parentId)` to change the limit in place
+(parent omitted keeps the existing parent). Every level is enforced independently.
+
+A group request is constrained by every level at once: capacity
+shortage on one resource throws `LeaseTakenError`; shortage on
+any quota level throws `QuotaExceededError` (with assertable `code`,
+`quota`, `requested` and `available`) and leaves not one share,
+no counters move and no queue position is left. Capacity and quota
+room are both observed lazily against the clock reading handed in: an expired but
+unswept share is already gone, and moving the clock backwards
+revives shares that were live once more, exactly as the reading given would.
+Reclaiming shares reclaimed at share granularity per credential; renewing only the
+sweep reclaims that share as the next grant. Freed shares
+fund waiting requests at the head of that resource's queue, and a
+share freed on a different resource under the same quota wakes them in strict
+arrival order.
