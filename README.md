@@ -1,6 +1,6 @@
 # lease-registry
 
-In-process lease registry that hands out time bounded leases to named holders, renews them, and reclaims the ones whose holder stopped renewing, so a resource is never held forever by a process that went away. It also supports atomic multi-resource acquisition: one call either holds every listed resource or holds none.
+In-process lease registry that hands out time bounded leases to named holders, renews them, and reclaims the ones whose holder stopped renewing, so a resource is never held forever by a process that went away. It also supports atomic multi-resource acquisition: one call either holds every listed resource or holds none. A resource may instead declare a **capacity**, in which case several holders occupy it at once, one independent share per credential, and shares may be constrained by a parent/child **quota hierarchy**.
 
 ## Requirements
 
@@ -16,23 +16,104 @@ Node.js 20 or newer. No runtime dependencies.
 
 ## Public interface
 
-`createRegistry({ ttlMs, clock = Date.now, logPath = null }) -> Registry`.
+`createRegistry({ ttlMs, clock = Date.now, logPath = null, capacities = null, quotas = null }) -> Registry`.
 - `Registry.acquire(resource, holder, ttlMs) -> { resource, holder, token, expiresAt }`.
   Passing an array of resources as the first argument is the atomic group
-  form, identical to `acquireAll`.
+  form, identical to `acquireAll`. Passing `{ resource, shares }` applies
+  for several shares of a capacity resource in one atomic call and returns
+  one credential per share.
 - `Registry.acquireAll(resources, holder, ttlMs, waitMs)` (aliases
   `acquireGroup`, `acquireMany`) acquires several resources atomically; see
   "Atomic groups" below.
 - `Registry.renew(token) -> boolean` extends a lease that is still live.
-- `Registry.release(token) -> boolean` ends a lease early.
-- `Registry.sweep(now) -> string[]` reclaims expired leases and names the resources it freed, ordered by expiry time.
-- `Registry.holder(resource) -> string | null` reports the current holder.
-- `Registry.stats() -> { granted, renewed, released, reclaimed, live }`.
+- `Registry.release(token) -> boolean` ends one share's lease early.
+- `Registry.sweep(now) -> string[]` reclaims expired shares and names their
+  resources, ordered by expiry time (one entry per reclaimed credential).
+- `Registry.holder(resource) -> string | null` reports a current holder.
+- `Registry.stats() -> { granted, renewed, released, reclaimed, live }`;
+  `live` counts the currently valid credentials, one per share.
 - `Registry.cancel(waitId) -> boolean` withdraws a still queued request.
 - `Registry.compact(now) -> { seq, leases }` folds the whole history into a
   crash-safe snapshot and restarts the event log from that point.
-- `LeaseTakenError` exported class carrying a `code` property.
+- `Registry.declareResource(resource, capacity, quota = null)` and
+  `Registry.declareQuota(node, limit, parent = null)` declare shapes at
+  runtime (before a resource is first used); both persist to the log.
+- `Registry.capacity(resource) -> number` and
+  `Registry.quotaUsage(node) -> number` report the declared capacity and the
+  shares currently charged to a quota level.
+- `LeaseTakenError` exported class carrying a `code` property
+  (`'LEASE_TAKEN'`). `QuotaExceededError` extends it with
+  `code: 'QUOTA_EXCEEDED'` and a `quota` property naming the blocking level.
 - `LogFileError` exported class carrying a `code` property (`'LOG_FILE_ERROR'`).
+
+### Capacity resources and hierarchical quotas
+
+A resource that never declares a capacity behaves exactly as before: one
+occupant at a time. Capacities and quotas are given to `createRegistry` as a
+plain object or `Map` (the shapes are fixed from the first grant on and may
+also be declared at runtime):
+
+```js
+createRegistry({
+  ttlMs: 1000,
+  quotas: {
+    root: 10,
+    team: { limit: 4, parent: 'root' },
+  },
+  capacities: {
+    // capacity, and the quota node the resource's shares charge to:
+    seats: { capacity: 4, quota: 'team' },
+    pool: 3,                       // capacity with no quota attachment
+  },
+})
+```
+
+`quotas` maps a node name to a positive limit, optionally with a `parent`.
+Every share held on an attached resource counts against its own node **and
+every ancestor**, and all levels are enforced together: a grant that fits the
+resource capacity and the leaf quota but would overflow the root fails just
+the same. `capacities` maps a resource to a positive capacity or to
+`{ capacity, quota }`. Quota entries may appear in any order; parents are
+wired in dependency order, and a cycle or an unknown parent throws `TypeError`.
+
+Applying for shares uses the same entry points:
+
+- `acquire({ resource: 'seats', shares: 2 }, holder, ttlMs?, waitMs?)` is an
+  atomic application for two shares of `seats`. Taking N shares is exactly
+  equivalent to listing that resource N times in one group: the call either
+  holds all N or none, and on success returns N lease objects, **one
+  credential per share**, each with its own token and its own absolute expiry.
+  A plain `acquire(resource, ...)` still asks for exactly one share and keeps
+  its single-lease return shape.
+- Inside `acquireAll`, entries may likewise be `{ resource, shares }`.
+  `ttlMs` is per listed entry, so every share minted for one entry shares that
+  entry's ttl but still expires as its own credential.
+
+Released or reclaimed shares become grantable again immediately. Expiry,
+renewal and early release are per credential (per share): one share expiring
+reclaims just that token and its share at every quota level, and renewing one
+share never moves the expiry of the other shares of the resource, whoever
+holds them. The four cumulative counters keep their exact meaning and count
+credentials, which is now the same as counting shares; `stats().live` is the
+number of currently valid shares.
+
+A group application is constrained by capacity and quota together. If it
+cannot hold every requested share, the no-`waitMs` call throws
+(`LeaseTakenError` with `code 'LEASE_TAKEN'` for a capacity/queue conflict and
+`QuotaExceededError` with `code 'QUOTA_EXCEEDED'` for a quota level), leaves no
+credential, no queue position and no counter movement, and changes no existing
+ownership; with a wait budget the whole request queues instead. Freed shares
+still go to the queue heads first, single and group requests strictly in
+arrival order even when mixed, and a share freed on one quota branch wakes a
+waiter queued on another branch when that is what made its levels fit.
+
+Declarations persist like everything else: runtime `declareResource` and
+`declareQuota` calls append to the log, and compaction folds capacities, quota
+definitions and per-level usage into the snapshot (the recorded usage is
+cross-checked against the lease image). After a restart or a compaction the
+share ownership, each credential's expiry, every quota level's occupancy and
+the four counters come back item for item; queued requests do not survive.
+
 
 ### Atomic groups
 
@@ -145,6 +226,16 @@ Wait-request deadlines are kept in a deadline min-heap rather than scanned
 linearly, so with many waiters queued at once timeout judgment and wake
 planning do not degrade with the total number of waiting requests; the
 observable behaviour is unchanged.
+
+### Share organization
+
+Each resource's shares sit in their own expiry min-heap, so deciding which
+shares are due only pops the heap head: acquiring on a saturated capacity
+resource, observing `holder`/`stats`, reclaiming when just a few of many
+shares expire, and planning the wake a free triggers all stay independent of
+the total number of coexisting shares. Queued requests are indexed per quota
+level, so freeing quota on one branch reaches the waiters on another branch
+without scanning shares held elsewhere.
 
 ## Tests
 
