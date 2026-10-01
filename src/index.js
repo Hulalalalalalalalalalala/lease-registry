@@ -1927,6 +1927,540 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     };
   }
 
+  // Read-only snapshot of the whole observable state. It never mutates
+  // anything: no expired credential is reclaimed, no waiter is timed out or
+  // woken, no owner heap is reconciled. Liveness is judged purely against
+  // the passed (or injected-clock) reading, the same `expiresAt > now` rule
+  // every live judgment uses. The returned object is a fresh JSON-shaped
+  // value holding no internal mutable reference; arrays are sorted by their
+  // primary key so the export is byte-stable for a given state and reading.
+  function exportState(now = clock()) {
+    if (!Number.isFinite(now)) {
+      throw new TypeError('now must be a finite number');
+    }
+
+    const stat = {
+      granted: counters.granted,
+      renewed: counters.renewed,
+      released: counters.released,
+      reclaimed: counters.reclaimed,
+      live: 0,
+    };
+
+    const quotaList = [];
+    for (const quota of quotas.values()) {
+      quotaList.push({
+        id: quota.id,
+        parentId: quota.parentId,
+        limit: quota.limit,
+        used: 0,
+      });
+    }
+    quotaList.sort((a, b) => compareKeys(a.id, b.id));
+
+    // Count every credential live at this reading, grouping live shares by
+    // the resource and by every quota level of its chain. A live share of a
+    // declared resource counts against its resource and every ancestor; a
+    // live credential on an undeclared resource counts only for itself.
+    const liveByResource = new Map();
+    const liveByQuota = new Map();
+    // Any live holder per resource, matching holder(): on a share resource
+    // with several live credentials the earliest-expiring one is reported.
+    const holderByResource = new Map();
+    const leaseList = [];
+    for (const [token, lease] of leases.entries()) {
+      const live = isLive(lease, now);
+      if (live) {
+        stat.live += 1;
+        liveByResource.set(
+          lease.resource,
+          (liveByResource.get(lease.resource) ?? 0) + 1,
+        );
+        for (const quota of lease.chain) {
+          liveByQuota.set(quota, (liveByQuota.get(quota) ?? 0) + 1);
+        }
+        const incumbent = holderByResource.get(lease.resource);
+        if (
+          incumbent === undefined
+          || lease.expiresAt < incumbent.expiresAt
+          || (lease.expiresAt === incumbent.expiresAt && lease.epoch < incumbent.epoch)
+        ) {
+          holderByResource.set(lease.resource, {
+            expiresAt: lease.expiresAt,
+            epoch: lease.epoch,
+            holder: lease.holder,
+          });
+        }
+      }
+      leaseList.push({
+        token,
+        resource: lease.resource,
+        holder: lease.holder,
+        expiresAt: lease.expiresAt,
+        ttlMs: lease.ttlMs,
+        epoch: lease.epoch,
+        live,
+        legacy: lease.legacy,
+      });
+    }
+    leaseList.sort((a, b) => compareKeys(a.token, b.token));
+
+    // A resource stays visible if it was declared, has a lease (even an
+    // expired-but-unreclaimed one), has waiters queued, or merely remembers
+    // a historical epoch; none of those may be dropped.
+    const resourceKeys = new Set(resourceStates.keys());
+    for (const resource of slots.keys()) {
+      resourceKeys.add(resource);
+    }
+    for (const resource of waitQueues.keys()) {
+      resourceKeys.add(resource);
+    }
+    for (const resource of epochs.keys()) {
+      resourceKeys.add(resource);
+    }
+    const resourceList = [];
+    for (const resource of resourceKeys) {
+      const rs = resourceStates.get(resource);
+      const declared = rs !== undefined && rs.declared;
+      const chain = rs !== undefined ? rs.chain : [];
+      const used = liveByResource.get(resource) ?? 0;
+      const incumbent = holderByResource.get(resource);
+      resourceList.push({
+        resource,
+        declared,
+        capacity: rs !== undefined ? rs.capacity : 1,
+        quota: chain.length === 0 ? null : chain[chain.length - 1].id,
+        used,
+        epoch: epochs.get(resource) ?? 0,
+        holder: incumbent === undefined ? null : incumbent.holder,
+      });
+    }
+    resourceList.sort((a, b) => compareKeys(a.resource, b.resource));
+
+    // Report the quota usage freshly counted from live credentials, so the
+    // export describes the passed reading rather than a lazily maintained
+    // owner figure that may predate it.
+    for (const quota of quotaList) {
+      quota.used = liveByQuota.get(quotas.get(quota.id)) ?? 0;
+    }
+
+    // Only requests still in the queue appear; a group occupying several
+    // queue positions (a repeated resource) is listed exactly once, and its
+    // resources keep the original row order, one entry per demanded row.
+    const listedGroups = new Set();
+    const waitList = [];
+    for (const queue of waitQueues.values()) {
+      for (const position of queue) {
+        const { group } = position;
+        if (listedGroups.has(group)) {
+          continue;
+        }
+        listedGroups.add(group);
+        waitList.push({
+          waitId: group.requestId,
+          holder: group.holder,
+          resources: group.positions.map((p) => ({
+            resource: p.resource,
+            count: p.count,
+          })),
+          deadlineAt: group.deadline,
+          status: group.deadline > now ? 'waiting' : 'timedOut',
+        });
+      }
+    }
+    waitList.sort((a, b) => compareKeys(a.waitId, b.waitId));
+
+    return {
+      at: now,
+      stats: stat,
+      quotas: quotaList,
+      resources: resourceList,
+      leases: leaseList,
+      waits: waitList,
+    };
+  }
+
+  // Total ordering for primary keys, which are usually strings but may be
+  // any JSON key a caller chose (numbers, booleans, ...). Values of
+  // different kinds are grouped by kind first so comparisons never rely on
+  // implicit coercion and equal keys always compare equal.
+  function compareKeys(a, b) {
+    if (a === b) {
+      return 0;
+    }
+    const ta = typeof a;
+    const tb = typeof b;
+    if (ta !== tb) {
+      return ta < tb ? -1 : 1;
+    }
+    return a < b ? -1 : 1;
+  }
+
+  // Read-only self-check. It recomputes every invariant from the raw tables
+  // instead of trusting derived figures, reports what it found and never
+  // repairs anything or throws on an internal discrepancy. Like exportState
+  // it neither reclaims, wakes nor times anything out; its structural checks
+  // are therefore framed the way the committed state actually keeps them:
+  // an owner counts exactly the shares its retired set has not observed
+  // gone, and a lazy observation at a different reading is left for the next
+  // mutating call rather than reported as corruption.
+  function checkConsistency(now = clock()) {
+    if (!Number.isFinite(now)) {
+      throw new TypeError('now must be a finite number');
+    }
+
+    const issues = [];
+    const issue = (kind, subject, expected, actual) => {
+      issues.push({ kind, subject, expected, actual });
+    };
+
+    // A share an owner has observed expire (and so no longer counts) is one
+    // whose token sits in the owner's retired set with a matching heap
+    // sequence. A record with a stale sequence describes a renewed lease and
+    // is treated as absent, the way the next reconcile would.
+    const ownerCountsShare = (owner, token, lease) => {
+      const record = owner.retired.get(token);
+      return record === undefined || record.heapSeq !== lease.heapSeq;
+    };
+
+    // Every lease still in the table must be reachable on the global expiry
+    // heap (so a sweep can reclaim it), on its resource heap, and on every
+    // quota heap of its chain (so lazy reconciliation can observe it). A
+    // renewed lease keeps its old stale nodes but always has one current
+    // node carrying the latest heap sequence; a structurally superseded
+    // lease is deleted from the table together with its nodes.
+    const heapHasCurrentNode = (heap, token, heapSeq) => {
+      for (const node of heap.nodes) {
+        if (node.token === token && node.heapSeq === heapSeq) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    // --- Leases and slots: the lease table is the authority, the per-
+    //     resource slot sets must mirror it exactly, epochs stay unique per
+    //     resource and below the high-water mark.
+    const epochSeenByResource = new Map();
+    for (const [token, lease] of leases.entries()) {
+      if (typeof token !== 'string' || token === '') {
+        issue('lease:token-key', keyOf(token), 'non-empty string', token);
+      }
+      if (!knownTokens.has(token)) {
+        issue('lease:known-token', token, true, false);
+      }
+      if (lease.resource === null || lease.resource === undefined) {
+        issue('lease:resource', token, 'named resource', lease.resource);
+      }
+      const set = slots.get(lease.resource);
+      if (set === undefined || !set.has(token)) {
+        issue('lease:slot-missing', token, true, false);
+      }
+      // The global heap is only ever popped by a sweep, which deletes the
+      // lease in the same commit, so every table lease has its current node.
+      if (!heapHasCurrentNode(expiryQueue, token, lease.heapSeq)) {
+        issue('lease:global-heap', token, true, false);
+      }
+      if (!Number.isFinite(lease.expiresAt) || !Number.isFinite(lease.ttlMs)) {
+        issue('lease:expiry', token, 'finite numbers', {
+          expiresAt: lease.expiresAt,
+          ttlMs: lease.ttlMs,
+        });
+      }
+      if (!Number.isInteger(lease.epoch) || lease.epoch <= 0) {
+        issue('lease:epoch', token, 'positive integer', lease.epoch);
+      } else {
+        let seen = epochSeenByResource.get(lease.resource);
+        if (seen === undefined) {
+          seen = new Set();
+          epochSeenByResource.set(lease.resource, seen);
+        }
+        // Committed credential epochs advance by exactly one, so two
+        // credentials of one resource can never share an epoch, including a
+        // live credential next to an expired, unreclaimed older one.
+        if (seen.has(lease.epoch)) {
+          issue(
+            'lease:epoch-unique',
+            `${keyOf(lease.resource)}#${lease.epoch}`,
+            1,
+            2,
+          );
+        }
+        seen.add(lease.epoch);
+        const high = epochs.get(lease.resource);
+        if (high === undefined || lease.epoch > high) {
+          issue('epoch:high-water', keyOf(lease.resource), high ?? 0, lease.epoch);
+        }
+      }
+    }
+    for (const [resource, set] of slots.entries()) {
+      for (const token of set) {
+        const lease = leases.get(token);
+        if (lease === undefined) {
+          issue('slot:lease-missing', token, true, false);
+        } else if (lease.resource !== resource) {
+          issue('slot:resource', token, keyOf(resource), keyOf(lease.resource));
+        }
+      }
+    }
+    const leasesChecked = leases.size;
+
+    // --- Resources: every resource the tables mention exists, the slot
+    //     count respects the capacity, the owner's live counter mirrors its
+    //     retired set, and leases carry the resource's quota chain.
+    let resourcesChecked = 0;
+    const resourceKeys = new Set([
+      ...resourceStates.keys(),
+      ...slots.keys(),
+      ...waitQueues.keys(),
+      ...epochs.keys(),
+    ]);
+    for (const resource of resourceKeys) {
+      resourcesChecked += 1;
+      const rs = resourceStates.get(resource);
+      const set = slots.get(resource);
+      const capacity = rs !== undefined ? rs.capacity : 1;
+      if (rs !== undefined && (!Number.isInteger(capacity) || capacity <= 0)) {
+        issue('resource:capacity-invalid', keyOf(resource), 'positive integer', capacity);
+      }
+      // Counted shares: table credentials the resource owner has not
+      // observed expire. This is exactly what rs.live maintains and exactly
+      // what capacity bounds.
+      let counted = 0;
+      for (const token of set ?? []) {
+        const lease = leases.get(token);
+        if (lease === undefined || rs === undefined) {
+          // A dangling slot or a lease without a resource state is reported
+          // by the lease loop above; it contributes nothing to a count.
+          continue;
+        }
+        if (ownerCountsShare(rs, token, lease)) {
+          counted += 1;
+          // A share the owner still counts either sits on its heap, or was
+          // revived by a backwards reading (which pushes the node back);
+          // there is no counted share without a current node.
+          if (!heapHasCurrentNode(rs.heap, token, lease.heapSeq)) {
+            issue('lease:resource-heap', token, true, false);
+          }
+        }
+        const sameChain = lease.chain.length === rs.chain.length
+          && lease.chain.every((q, i) => q === rs.chain[i]);
+        if (!sameChain) {
+          issue('lease:quota-chain', token, 'resource chain', 'different chain');
+        }
+      }
+      if (rs !== undefined) {
+        if (rs.live !== counted) {
+          issue('resource:used', keyOf(resource), counted, rs.live);
+        }
+        if (counted > capacity) {
+          issue('resource:capacity', keyOf(resource), capacity, counted);
+        }
+        if (!rs.declared && counted > 1) {
+          issue('resource:exclusive', keyOf(resource), 1, counted);
+        }
+      }
+    }
+
+    // --- Quotas: forest shape, and per-level counted usage mirroring the
+    //     quota's own retired set and staying within its limit.
+    let quotasChecked = 0;
+    for (const quota of quotas.values()) {
+      quotasChecked += 1;
+      if (!Number.isInteger(quota.limit) || quota.limit <= 0) {
+        issue('quota:limit', keyOf(quota.id), 'positive integer', quota.limit);
+      }
+      if (quota.parentId !== null) {
+        const parent = quotas.get(quota.parentId);
+        if (parent === undefined) {
+          issue('quota:parent', keyOf(quota.id), 'known quota', null);
+        } else if (parent === quota) {
+          issue('quota:parent', keyOf(quota.id), 'different node', 'self');
+        }
+      }
+      let counted = 0;
+      for (const resource of quota.resources) {
+        const rs = resourceStates.get(resource);
+        if (rs === undefined || !rs.chain.includes(quota)) {
+          issue('quota:resource-link', keyOf(resource), 'declared under quota', false);
+          continue;
+        }
+        for (const token of slots.get(resource) ?? []) {
+          const lease = leases.get(token);
+          if (lease !== undefined && ownerCountsShare(quota, token, lease)) {
+            counted += 1;
+            if (!heapHasCurrentNode(quota.heap, token, lease.heapSeq)) {
+              issue('lease:quota-heap', token, true, false);
+            }
+          }
+        }
+      }
+      if (quota.live !== counted) {
+        issue('quota:used', keyOf(quota.id), counted, quota.live);
+      }
+      if (counted > quota.limit) {
+        issue('quota:limit-exceeded', keyOf(quota.id), quota.limit, counted);
+      }
+    }
+    // Reverse direction of the resource/quota declaration link.
+    for (const [resource, rs] of resourceStates) {
+      if (!rs.declared) {
+        continue;
+      }
+      for (const quota of rs.chain) {
+        if (!quotas.has(quota.id)) {
+          issue('resource:quota-missing', keyOf(resource), keyOf(quota.id), null);
+        } else if (!quota.resources.has(resource)) {
+          issue('resource:quota-link', keyOf(resource), true, false);
+        }
+      }
+    }
+
+    // --- Epoch high-water marks: every resource that ever granted carries
+    //     a positive remembered epoch.
+    let epochsChecked = 0;
+    for (const [resource, high] of epochs.entries()) {
+      epochsChecked += 1;
+      if (!Number.isInteger(high) || high <= 0) {
+        issue('epoch:value', keyOf(resource), 'positive integer', high);
+      }
+      const seen = epochSeenByResource.get(resource) ?? [];
+      for (const value of seen) {
+        if (value > high) {
+          issue('epoch:high-water', keyOf(resource), high, value);
+        }
+      }
+    }
+
+    // --- Wait queues: per-resource FIFO arrays and the pending index must
+    //     agree exactly, each position belongs to its group once, the
+    //     deadline heap still names it, arrival order is preserved, and the
+    //     quota wait indexes mirror the queue lengths.
+    let waitsChecked = 0;
+    const queuedGroups = new Map();
+    for (const [resource, queue] of waitQueues.entries()) {
+      if (!Array.isArray(queue) || queue.length === 0) {
+        issue('wait:queue', keyOf(resource), 'non-empty array', queue);
+      }
+      let lastArrival = -1;
+      for (const position of queue) {
+        waitsChecked += 1;
+        const { group } = position;
+        if (position.resource !== resource) {
+          issue('wait:resource', group.requestId, keyOf(resource), keyOf(position.resource));
+        }
+        if (!pendingGroups.has(group.requestId)) {
+          issue('wait:pending', group.requestId, true, false);
+        }
+        if (!group.positions.includes(position)) {
+          issue('wait:position', group.requestId, true, false);
+        }
+        queuedGroups.set(group.requestId, group);
+        // FIFO: own repeated rows share an arrival; every later request has
+        // a strictly greater one.
+        if (group.arrival < lastArrival) {
+          issue('wait:fifo', keyOf(resource), 'arrival order', 'out of order');
+        }
+        lastArrival = group.arrival;
+        if (
+          group.deadlineNode === null
+          || group.deadlineNode === undefined
+          || group.deadlineNode.requestId !== group.requestId
+          || group.deadlineNode.dead
+          || group.deadlineNode.deadline !== group.deadline
+        ) {
+          issue('wait:deadline-node', group.requestId, 'live matching heap node', false);
+        }
+      }
+      // Every queued position adds one wait reference per quota of the
+      // resource's chain, and the resource stays indexed while any remains.
+      const rs = resourceStates.get(resource);
+      if (rs !== undefined) {
+        for (const quota of rs.chain) {
+          const refs = rs.waitRefs.get(quota) ?? 0;
+          if (refs !== queue.length) {
+            issue(
+              'wait:quota-refs',
+              `${keyOf(resource)}/${keyOf(quota.id)}`,
+              queue.length,
+              refs,
+            );
+          }
+          if (refs > 0 && !quota.waitingResources.has(resource)) {
+            issue('wait:quota-index', keyOf(resource), 'indexed', 'missing');
+          }
+          if (refs === 0 && quota.waitingResources.has(resource)) {
+            issue('wait:quota-index', keyOf(resource), 'not indexed', 'present');
+          }
+        }
+      }
+    }
+    for (const [requestId, group] of pendingGroups.entries()) {
+      if (group.requestId !== requestId) {
+        issue('wait:id', requestId, requestId, group.requestId);
+      }
+      if (!queuedGroups.has(requestId)) {
+        issue('wait:queue-missing', requestId, true, false);
+      }
+      let heapNodeFound = false;
+      for (const node of deadlineQueue.nodes) {
+        if (node.requestId === requestId) {
+          heapNodeFound = true;
+          if (node !== group.deadlineNode || node.dead) {
+            issue('wait:deadline-heap', requestId, 'live own node', false);
+          }
+        }
+      }
+      if (!heapNodeFound) {
+        issue('wait:deadline-heap', requestId, true, false);
+      }
+      for (const position of group.positions) {
+        const queue = waitQueues.get(position.resource);
+        if (queue === undefined || !queue.includes(position)) {
+          issue('wait:group-position', requestId, keyOf(position.resource), 'missing');
+        }
+      }
+    }
+
+    // --- Counters: the four cumulative counters must stay non-negative, and
+    //     an early release or a reclaim can only remove a credential a grant
+    //     produced. A transfer removes one old credential while granting one
+    //     new one without a release/reclaim counter move, so the table size
+    //     is deliberately not equated with granted - released - reclaimed.
+    if (
+      !Number.isInteger(counters.granted) || counters.granted < 0 ||
+      !Number.isInteger(counters.renewed) || counters.renewed < 0 ||
+      !Number.isInteger(counters.released) || counters.released < 0 ||
+      !Number.isInteger(counters.reclaimed) || counters.reclaimed < 0
+    ) {
+      issue('stats:counters', 'counters', 'non-negative integers', { ...counters });
+    }
+    if (counters.released + counters.reclaimed > counters.granted) {
+      issue(
+        'stats:removals',
+        'counters',
+        `<= ${counters.granted}`,
+        counters.released + counters.reclaimed,
+      );
+    }
+
+    return {
+      ok: issues.length === 0,
+      checked: {
+        leases: leasesChecked,
+        resources: resourcesChecked,
+        quotas: quotasChecked,
+        waits: waitsChecked,
+        epochs: epochsChecked,
+      },
+      issues,
+    };
+  }
+
+  function keyOf(value) {
+    return typeof value === 'string' ? value : String(value);
+  }
+
   // Fold the whole history into one snapshot and restart the event log from
   // that point. The snapshot is published first (temp + fsync + rename) and
   // the trimmed log second; a failure at either step leaves the previously
@@ -2083,6 +2617,8 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     stats,
     cancel,
     compact,
+    exportState,
+    checkConsistency,
   };
 
   function applyReplayQuota(entry) {

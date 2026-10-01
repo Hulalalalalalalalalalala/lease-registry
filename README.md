@@ -41,6 +41,11 @@ Node.js 20 or newer. No runtime dependencies.
   `resource` carrying exactly the resource's last committed `epoch`; every
   other case throws `LeaseFencedError` (`code` `'LEASE_FENCED'`).
 - `Registry.stats() -> { granted, renewed, released, reclaimed, live }`.
+- `Registry.exportState(now = clock()) -> object` returns a read-only JSON
+  snapshot of the whole registry state; see "State export and consistency
+  check" below.
+- `Registry.checkConsistency(now = clock()) -> { ok, checked, issues }`
+  performs a read-only self-check; see below.
 - `Registry.cancel(waitId) -> boolean` withdraws a still queued request.
 - `Registry.compact(now) -> { seq, leases }` folds the whole history into a
   crash-safe snapshot and restarts the event log from that point.
@@ -261,6 +266,48 @@ Wait-request deadlines are kept in a deadline min-heap rather than scanned
 linearly, so with many waiters queued at once timeout judgment and wake
 planning do not degrade with the total number of waiting requests; the
 observable behaviour is unchanged.
+
+### State export and consistency check
+
+`exportState(now = clock())` returns a fresh JSON-shaped object describing
+the whole registry at the given clock reading (the injected clock is used
+when `now` is omitted; a non-finite `now` throws `TypeError`). It is strictly
+read-only: it changes no internal state, reclaims no expired credential,
+purges or wakes no waiter, and returns no internal mutable reference, so
+mutating the result cannot affect the registry. The object always contains
+exactly the keys `at`, `stats`, `quotas`, `resources`, `leases` and `waits`,
+with the four arrays sorted by their primary key:
+
+- `stats` is `{ granted, renewed, released, reclaimed, live }`, with `live`
+  counted from the credentials whose `expiresAt > now`.
+- `quotas` lists `{ id, parentId, limit, used }` for every quota, with
+  `used` the number of live shares under it at this reading.
+- `resources` lists one row per resource that is declared, carries a lease
+  (including an expired, unreclaimed one), has a queued waiter or merely
+  remembers a historical epoch. Each row is
+  `{ resource, declared, capacity, quota, used, epoch, holder }`; an
+  undeclared resource is presented as a single-capacity resource with no
+  quota, and `holder` is any current live holder (`null` when none).
+- `leases` lists every credential still in the table — an expired but not
+  yet reclaimed credential stays listed — as
+  `{ token, resource, holder, expiresAt, ttlMs, epoch, live, legacy }`, with
+  `live` judged at `now`.
+- `waits` lists only requests still in the queue, one row per queued group,
+  as `{ waitId, holder, resources, deadlineAt, status }`; `resources` keeps
+  the request's original row order as `{ resource, count }`, and `status` is
+  `'waiting'` or `'timedOut'` (a past-deadline request is reported timed out
+  without being purged).
+
+`checkConsistency(now = clock())` (same `now` rules) recomputes the internal
+invariants without trusting the derived counters and returns
+`{ ok, checked, issues }`. It never throws on an internal discrepancy and
+never repairs anything. `checked` reports how many `leases`, `resources`,
+`quotas`, `waits` (queue positions) and `epochs` were reviewed, covering
+token uniqueness, the lease/slot correspondence, resource capacity, every
+quota level, the epoch high-water marks, the wait queues and the statistics
+counters. When everything is consistent `ok` is `true` and `issues` is
+empty; otherwise `ok` is `false` and each issue pinpoints its finding as
+`{ kind, subject, expected, actual }`.
 
 ## Tests
 
