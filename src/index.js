@@ -13,9 +13,10 @@
 //
 // Every resource keeps a credential epoch, starting at 1 on its first grant
 // and advanced by exactly one per committed credential (retake, same-holder
-// reacquisition and woken grants included). Renewals never advance it, nor do
-// failed, queued, timed-out, cancelled or partially committed requests; it
-// never moves backwards and survives restarts and compactions. The newest
+// reacquisition, woken grant and holder transfer included). Renewals never
+// advance it, nor do failed, queued, timed-out, cancelled or partially
+// committed requests; it never moves backwards and survives restarts and
+// compactions. The newest
 // credential of an exclusive resource is therefore the leader epoch, and
 // assertLease is the fence a holder passes only while it still is that
 // leader.
@@ -1656,6 +1657,98 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     return true;
   }
 
+  // Hand one live exclusive credential from its current holder to a new
+  // holder without a free gap. The old credential dies as a fresh one is
+  // born: a single transfer event commits both credentials and the epoch in
+  // one write, so a failed append leaves the old credential fully usable and
+  // produces no new token. A transfer consumes exactly one epoch but moves no
+  // share and none of the four counters, so it never frees capacity or quota
+  // room and can never wake a waiter; other credentials of an atomic group
+  // are untouched.
+  function transfer(token, holder, ttlMs = undefined) {
+    if (typeof token !== 'string' || typeof holder !== 'string' || holder === '') {
+      throw new TypeError('token and holder must be non-empty strings');
+    }
+    const effectiveTtl = ttlMs === undefined ? defaultTtlMs : ttlMs;
+    if (!Number.isFinite(effectiveTtl) || effectiveTtl <= 0) {
+      throw new TypeError('ttlMs must be a positive finite number');
+    }
+    const lease = leases.get(token);
+    if (lease === undefined || lease.legacy) {
+      // Unknown, released, reclaimed or minted before a restart.
+      throw new LeaseFencedError(lease === undefined ? null : lease.resource);
+    }
+    const resource = lease.resource;
+    const rs = resourceStates.get(resource);
+    if (
+      // Only a current credential of an exclusive (never declared) resource
+      // may be handed over: every share of a shareable resource is an
+      // independent credential, and any credential not carrying the
+      // resource's last epoch is already a stale leader.
+      rs === undefined ||
+      rs.declared ||
+      epochs.get(resource) !== lease.epoch
+    ) {
+      throw new LeaseFencedError(resource);
+    }
+    const now = clock();
+    // Judge liveness at the reading as given, the same way renew does: a
+    // clock that moved backwards may have revived the share.
+    reconcile(rs, now);
+    for (const quota of lease.chain) {
+      reconcile(quota, now);
+    }
+    if (lease.expiresAt <= now) {
+      throw new LeaseFencedError(resource);
+    }
+    purgeExpiredWaiters(now);
+
+    const nextEpoch = (epochs.get(resource) ?? 0) + 1;
+    const minted = mintToken(now, tokenSequence);
+    const expiresAt = now + effectiveTtl;
+    appendEvent({
+      v: LOG_VERSION,
+      type: 'transfer',
+      at: now,
+      from: token,
+      token: minted.token,
+      resource,
+      holder,
+      ttlMs: effectiveTtl,
+      expiresAt,
+      epoch: nextEpoch,
+    });
+
+    // The write landed: swap the credentials. Occupancy is constant - one
+    // live share comes out and one goes back in at every owner level - and
+    // the old expiry nodes retire lazily exactly like a release's.
+    tokenSequence = minted.seq;
+    knownTokens.add(minted.token);
+    retirePermanent(lease);
+    leases.delete(token);
+    removeSlot(resource, token);
+    const nextLease = {
+      resource,
+      holder,
+      expiresAt,
+      ttlMs: effectiveTtl,
+      legacy: false,
+      heapSeq: 0,
+      batch: null,
+      epoch: nextEpoch,
+      chain: lease.chain,
+    };
+    leases.set(minted.token, nextLease);
+    epochs.set(resource, nextEpoch);
+    addSlot(resource, minted.token);
+    rs.live += 1;
+    for (const quota of lease.chain) {
+      quota.live += 1;
+    }
+    pushLeaseHeaps(minted.token, nextLease);
+    return { resource, holder, token: minted.token, expiresAt, epoch: nextEpoch };
+  }
+
   // Cancelling only lands on a request that is still queued: an already
   // woken, expired or cancelled request reports false, as does an unknown id.
   function cancel(requestId) {
@@ -1982,6 +2075,7 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     setQuota,
     renew,
     release,
+    transfer,
     sweep,
     holder,
     epoch,
@@ -2584,6 +2678,70 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
           removeSlot(lease.resource, event.token);
         }
         counters.released += 1;
+        break;
+      }
+      case 'transfer': {
+        if (
+          typeof event.from !== 'string' ||
+          typeof event.token !== 'string' ||
+          event.resource === null || event.resource === undefined ||
+          !Number.isFinite(event.ttlMs) ||
+          !Number.isFinite(event.expiresAt) ||
+          !Number.isInteger(event.epoch) ||
+          event.epoch <= 0
+        ) {
+          throw new LogFileError(
+            `corrupt transfer entry on line ${lineNumber} of ${logPath}`,
+          );
+        }
+        // A transfer commits one fresh credential carrying the next epoch, so
+        // the same monotonic rule as an acquire applies.
+        const expectedEpoch = (epochs.get(event.resource) ?? 0) + 1;
+        if (event.epoch !== expectedEpoch) {
+          throw new LogFileError(
+            `non-monotonic lease epoch on line ${lineNumber} of ${logPath}`,
+          );
+        }
+        replayBatchId = null;
+        replayBatchTokens = new Set();
+        // Structural handover: the old credential vacates the slot and the
+        // table without any counter movement, exactly as it did in the
+        // process that committed the transfer.
+        const oldLease = leases.get(event.from);
+        if (oldLease !== undefined) {
+          const oldRs = resourceStates.get(oldLease.resource);
+          removeHeapNodes(oldRs.heap, event.from);
+          for (const q of oldLease.chain) {
+            removeHeapNodes(q.heap, event.from);
+          }
+          retirePermanent(oldLease);
+          leases.delete(event.from);
+          removeSlot(oldLease.resource, event.from);
+        }
+        const rs = resourceStateFor(event.resource);
+        const lease = {
+          resource: event.resource,
+          holder: event.holder,
+          expiresAt: event.expiresAt,
+          ttlMs: event.ttlMs,
+          // Credentials issued before this process started are void: the
+          // lease keeps occupying its resource, but its token cannot renew
+          // or release it.
+          legacy: true,
+          heapSeq: 0,
+          epoch: event.epoch,
+          batch: null,
+          chain: rs.chain,
+        };
+        leases.set(event.token, lease);
+        addSlot(event.resource, event.token);
+        knownTokens.add(event.token);
+        epochs.set(event.resource, event.epoch);
+        rs.live += 1;
+        for (const quota of rs.chain) {
+          quota.live += 1;
+        }
+        pushLeaseHeaps(event.token, lease);
         break;
       }
       case 'reclaim': {

@@ -28,6 +28,10 @@ Node.js 20 or newer. No runtime dependencies.
   hierarchical quotas" below.
 - `Registry.renew(token) -> boolean` extends a lease that is still live.
 - `Registry.release(token) -> boolean` ends a lease early.
+- `Registry.transfer(token, holder, ttlMs = undefined) ->
+  { resource, holder, token, expiresAt, epoch }` hands a live exclusive
+  credential straight to a new holder without a free gap; see "Holder
+  transfer" below.
 - `Registry.sweep(now) -> string[]` reclaims expired leases and names the resources it freed, ordered by expiry time.
 - `Registry.holder(resource) -> string | null` reports the current holder.
 - `Registry.epoch(resource) -> number` reports the resource's last committed
@@ -90,6 +94,48 @@ credentials across restart and compaction; recovery never advances an
 epoch a second time. On a share resource several live credentials coexist
 with distinct epochs, and only the one carrying the resource's last epoch
 passes the fence.
+
+### Holder transfer
+
+`Registry.transfer(token, holder, ttlMs = undefined)` lets the current
+holder of an exclusive resource hand it directly to a new holder, so the
+resource is never ownerless between a `release` and the next `acquire`.
+`token` must be a live exclusive credential minted by this process and
+still carrying its resource's last committed epoch; `holder` must be a
+non-empty string. When `ttlMs` is omitted the new credential uses the
+registry default TTL; when given it must be a positive finite number.
+
+On success the old credential dies at the same instant a fresh credential
+is born: the call returns
+`{ resource, holder, token, expiresAt, epoch }`, where `expiresAt` is the
+registry clock reading at the call plus the chosen TTL and `epoch` is the
+old epoch plus one. Afterwards the old token behaves exactly like a
+released one — `renew` and `release` return `false` and
+`assertLease(resource, oldToken, oldEpoch)` throws `LeaseFencedError` —
+while `assertLease(resource, newToken, newEpoch)` returns `true`. The new
+credential may itself be renewed, released or transferred again.
+
+A transfer moves no share: occupancy before and after is exactly one, so
+it never frees capacity or quota room and never wakes a waiter; waiting
+requests, queue positions, ticket states and FIFO wake order are
+untouched. Within an atomic group any one credential may be transferred
+on its own while the group's other credentials keep working. None of the
+four counters moves — `granted`, `renewed`, `released` and `reclaimed`
+stay put and `stats().live` is 1 both before and after.
+
+`transfer` throws `LeaseFencedError` when the token is unknown, already
+released, reclaimed, expired, minted before a restart, belongs to a
+shareable (declared) resource, or is no longer a current credential.
+Non-string `token` or `holder`, an empty `holder`, or a non-positive,
+non-finite `ttlMs` throws `TypeError`.
+
+When `logPath` is set, exactly one `transfer` event is appended and the
+old credential, the new credential and the epoch commit in that single
+write. If the write fails the call throws `LogFileError` and rolls fully
+back: the old credential can still renew, release and pass the fence, no
+new token exists, and the epoch and counters never moved. Replay and
+compaction preserve the old/new credential relationship exactly; both
+credentials are void after a restart, as with every recovered credential.
 
 ### Atomic groups
 
@@ -157,8 +203,9 @@ of a live queue. Only the eventual grant is written to the log (in the same
 write as the release or reclaim that triggered it), so queued requests do
 not survive a restart.
 
-When `logPath` points at a file, every grant, renewal, early release and
-reclaim is appended to it as one JSON line; each acquire line carries the
+When `logPath` points at a file, every grant, renewal, early release,
+holder transfer and
+reclaim is appended to it as one JSON line; each acquire (and transfer) line carries the
 credential epoch atomically with the grant. On startup the history is replayed
 in order, so unexpired leases keep occupying their resources, the four
 cumulative counters come back exactly as they were, and every resource's
