@@ -2083,7 +2083,384 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     stats,
     cancel,
     compact,
+    exportState,
+    checkConsistency,
   };
+
+  // Primary-key ordering for the exported arrays: ids are compared as
+  // strings, so a mixed-type forest still serializes deterministically.
+  function compareKeys(a, b) {
+    const sa = String(a);
+    const sb = String(b);
+    if (sa === sb) {
+      return 0;
+    }
+    return sa < sb ? -1 : 1;
+  }
+
+  // Live share usage at the reading, derived straight from the lease table
+  // without touching any owner's lazy bookkeeping: an export or a
+  // self-check must observe, never reconcile, purge or wake.
+  function liveUsageAt(now) {
+    const byResource = new Map();
+    const byQuota = new Map();
+    for (const lease of leases.values()) {
+      if (lease.expiresAt <= now) {
+        continue;
+      }
+      byResource.set(lease.resource, (byResource.get(lease.resource) ?? 0) + 1);
+      for (const quota of lease.chain) {
+        byQuota.set(quota.id, (byQuota.get(quota.id) ?? 0) + 1);
+      }
+    }
+    return { byResource, byQuota };
+  }
+
+  // Every resource an export must name: declared ones plus anything with a
+  // lease, a queued wait or a committed epoch, in primary-key order. A
+  // resource only ever probed (a holder() lookup that created its lazy
+  // bookkeeping) carries no state worth exporting and stays unlisted.
+  function exportableResources() {
+    const names = new Set();
+    for (const [resource, rs] of resourceStates) {
+      if (rs.declared) {
+        names.add(resource);
+      }
+    }
+    for (const resource of slots.keys()) {
+      names.add(resource);
+    }
+    for (const resource of waitQueues.keys()) {
+      names.add(resource);
+    }
+    for (const resource of epochs.keys()) {
+      names.add(resource);
+    }
+    return [...names].sort(compareKeys);
+  }
+
+  // The holder an observation at `now` would report, judged straight from
+  // the table: of the live credentials the one expiring soonest leads,
+  // exactly like the expiry-heap top liveHolder reads; tokens break ties so
+  // the answer is deterministic.
+  function exportHolder(resource, now) {
+    let bestToken = null;
+    let best = null;
+    for (const [token, lease] of leases) {
+      if (lease.resource !== resource || lease.expiresAt <= now) {
+        continue;
+      }
+      if (
+        best === null ||
+        lease.expiresAt < best.expiresAt ||
+        (lease.expiresAt === best.expiresAt && compareKeys(token, bestToken) < 0)
+      ) {
+        best = lease;
+        bestToken = token;
+      }
+    }
+    return best === null ? null : best.holder;
+  }
+
+  // Read-only state export at the passed reading (the injected clock when
+  // omitted). Nothing is reconciled, purged, granted or reclaimed:
+  // expired-but-unswept credentials stay listed under `leases` (flagged by
+  // `live`), timed-out requests stay queued under `waits` (flagged by
+  // `status`), and every figure is derived from the tables as they stand.
+  // The result is a plain JSON-shaped snapshot sharing no mutable structure
+  // with the registry.
+  function exportState(now = clock()) {
+    if (!Number.isFinite(now)) {
+      throw new TypeError('now must be a finite number');
+    }
+    const usage = liveUsageAt(now);
+
+    const quotaList = [...quotas.values()]
+      .map((quota) => ({
+        id: quota.id,
+        parentId: quota.parentId,
+        limit: quota.limit,
+        used: usage.byQuota.get(quota.id) ?? 0,
+      }))
+      .sort((a, b) => compareKeys(a.id, b.id));
+
+    const resourceList = exportableResources().map((resource) => {
+      const rs = resourceStates.get(resource);
+      const declared = rs !== undefined && rs.declared;
+      const chain = rs === undefined ? [] : rs.chain;
+      return {
+        resource,
+        declared,
+        capacity: declared ? rs.capacity : 1,
+        quota: chain.length === 0 ? null : chain[chain.length - 1].id,
+        used: usage.byResource.get(resource) ?? 0,
+        epoch: epochs.get(resource) ?? 0,
+        holder: exportHolder(resource, now),
+      };
+    });
+
+    const leaseList = [...leases.entries()]
+      .map(([token, lease]) => ({
+        token,
+        resource: lease.resource,
+        holder: lease.holder,
+        expiresAt: lease.expiresAt,
+        ttlMs: lease.ttlMs,
+        epoch: lease.epoch,
+        live: lease.expiresAt > now,
+        legacy: lease.legacy,
+      }))
+      .sort((a, b) => compareKeys(a.token, b.token));
+
+    // Only requests still queued are listed; a request whose deadline the
+    // reading has passed but that no operation has purged yet reports
+    // 'timedOut' instead of disappearing.
+    const waitList = [...pendingGroups.values()]
+      .map((group) => ({
+        waitId: group.requestId,
+        holder: group.holder,
+        resources: group.positions.map((position) => ({
+          resource: position.resource,
+          count: position.count,
+        })),
+        deadlineAt: group.deadline,
+        status: group.deadline <= now ? 'timedOut' : 'waiting',
+      }))
+      .sort((a, b) => compareKeys(a.waitId, b.waitId));
+
+    let live = 0;
+    for (const count of usage.byResource.values()) {
+      live += count;
+    }
+
+    return {
+      at: now,
+      stats: {
+        granted: counters.granted,
+        renewed: counters.renewed,
+        released: counters.released,
+        reclaimed: counters.reclaimed,
+        live,
+      },
+      quotas: quotaList,
+      resources: resourceList,
+      leases: leaseList,
+      waits: waitList,
+    };
+  }
+
+  // Read-only self-check at the passed reading. Recomputes every invariant
+  // the registry maintains - token uniqueness, lease/slot correspondence,
+  // capacity and per-level quota room, the epoch high-water marks, the wait
+  // queue wiring and the counters - and reports each violation as a
+  // { kind, subject, expected, actual } issue instead of throwing. Nothing
+  // is repaired: the state afterwards is exactly the state before.
+  function checkConsistency(now = clock()) {
+    if (!Number.isFinite(now)) {
+      throw new TypeError('now must be a finite number');
+    }
+    const issues = [];
+    const report = (kind, subject, expected, actual) => {
+      issues.push({ kind, subject, expected, actual });
+    };
+
+    // Token uniqueness and the lease/slot correspondence: every slot names
+    // a lease of its own resource, every table lease occupies its slot, and
+    // no token sits in two resources at once.
+    const slotOwner = new Map();
+    for (const [resource, set] of slots) {
+      for (const token of set) {
+        const previous = slotOwner.get(token);
+        if (previous !== undefined) {
+          report('duplicate-token', token, previous, resource);
+        } else {
+          slotOwner.set(token, resource);
+        }
+        const lease = leases.get(token);
+        if (lease === undefined) {
+          report('slot-lease-missing', token, 'present', 'absent');
+        } else if (lease.resource !== resource) {
+          report('slot-resource-mismatch', token, lease.resource, resource);
+        }
+      }
+    }
+    for (const [token, lease] of leases) {
+      const set = slots.get(lease.resource);
+      if (set === undefined || !set.has(token)) {
+        report('lease-slot-missing', token, 'present', 'absent');
+      }
+      if (!knownTokens.has(token)) {
+        report('token-unregistered', token, 'known', 'unknown');
+      }
+    }
+
+    // Capacity and every quota level, judged by live shares at the reading.
+    const usage = liveUsageAt(now);
+    const resourceNames = exportableResources();
+    for (const resource of resourceNames) {
+      const rs = resourceStates.get(resource);
+      const capacity = rs !== undefined && rs.declared ? rs.capacity : 1;
+      const used = usage.byResource.get(resource) ?? 0;
+      if (used > capacity) {
+        report('capacity-exceeded', resource, capacity, used);
+      }
+    }
+    for (const quota of quotas.values()) {
+      const used = usage.byQuota.get(quota.id) ?? 0;
+      if (used > quota.limit) {
+        report('quota-exceeded', quota.id, quota.limit, used);
+      }
+      if (quota.parentId !== null && !quotas.has(quota.parentId)) {
+        report('quota-parent-missing', quota.id, 'declared', quota.parentId);
+      }
+    }
+    for (const quota of quotas.values()) {
+      const seen = new Set();
+      let current = quota;
+      while (current !== undefined && current !== null) {
+        if (seen.has(current)) {
+          report('quota-cycle', quota.id, 'forest', 'cycle');
+          break;
+        }
+        seen.add(current);
+        current = current.parentId === null ? undefined : quotas.get(current.parentId);
+      }
+    }
+
+    // Epoch high-water marks: every committed epoch is a positive integer,
+    // every table credential carries an epoch between 1 and its resource's
+    // mark, and no two credentials of one resource share an epoch.
+    for (const [resource, value] of epochs) {
+      if (!Number.isInteger(value) || value < 1) {
+        report('epoch-invalid', resource, 'positive integer', value);
+      }
+    }
+    const leaseEpochs = new Map();
+    for (const [token, lease] of leases) {
+      const high = epochs.get(lease.resource) ?? 0;
+      if (!Number.isInteger(lease.epoch) || lease.epoch < 1 || lease.epoch > high) {
+        report('epoch-high-water', token, high, lease.epoch);
+      }
+      let seen = leaseEpochs.get(lease.resource);
+      if (seen === undefined) {
+        seen = new Set();
+        leaseEpochs.set(lease.resource, seen);
+      }
+      if (seen.has(lease.epoch)) {
+        report('epoch-duplicate', lease.resource, 'unique', lease.epoch);
+      } else {
+        seen.add(lease.epoch);
+      }
+    }
+
+    // Wait-queue wiring: every pending group sits on its resources' queues
+    // with a waiting ticket and a consistent deadline, and every queued
+    // position belongs to a pending group.
+    for (const [requestId, group] of pendingGroups) {
+      if (group.ticket.status !== 'waiting') {
+        report('wait-status', requestId, 'waiting', group.ticket.status);
+      }
+      if (group.deadlineNode.deadline !== group.deadline) {
+        report('wait-deadline', requestId, group.deadline, group.deadlineNode.deadline);
+      }
+      for (const position of group.positions) {
+        const queue = waitQueues.get(position.resource);
+        if (queue === undefined || !queue.includes(position)) {
+          report('wait-position-missing', requestId, position.resource, 'absent');
+        }
+        if (position.group !== group) {
+          report('wait-position-group', requestId, requestId, position.group.requestId);
+        }
+      }
+    }
+    for (const [resource, queue] of waitQueues) {
+      if (queue.length === 0) {
+        report('wait-queue-empty', resource, 'removed', 'present');
+      }
+      for (const position of queue) {
+        const group = position.group;
+        if (
+          group === undefined ||
+          group === null ||
+          pendingGroups.get(group.requestId) !== group
+        ) {
+          report('wait-position-orphan', resource, 'pending', 'detached');
+        } else if (!group.positions.includes(position)) {
+          report('wait-position-orphan', resource, 'group position', 'foreign');
+        }
+      }
+    }
+
+    // Counters: the four cumulative figures are non-negative integers, and
+    // grants minus releases minus reclaims accounts exactly for the lease
+    // table (a transfer swaps credentials without moving any counter).
+    for (const key of ['granted', 'renewed', 'released', 'reclaimed']) {
+      if (!Number.isInteger(counters[key]) || counters[key] < 0) {
+        report('counter-invalid', key, 'non-negative integer', counters[key]);
+      }
+    }
+    const accounted = counters.granted - counters.released - counters.reclaimed;
+    if (accounted !== leases.size) {
+      report('counter-drift', 'leases', accounted, leases.size);
+    }
+
+    // Lazy owner bookkeeping: every table lease is either counted in an
+    // owner's live figure or remembered in its retired set, never both and
+    // never neither. Retired entries whose token already left the table are
+    // inert rememberings a backwards reading cleans up lazily, so only
+    // entries naming a table lease count against the live figure.
+    const tableByResource = new Map();
+    for (const lease of leases.values()) {
+      tableByResource.set(
+        lease.resource,
+        (tableByResource.get(lease.resource) ?? 0) + 1,
+      );
+    }
+    for (const [resource, rs] of resourceStates) {
+      let retiredHeld = 0;
+      for (const token of rs.retired.keys()) {
+        const lease = leases.get(token);
+        if (lease !== undefined && lease.resource === resource) {
+          retiredHeld += 1;
+        }
+      }
+      const expected = (tableByResource.get(resource) ?? 0) - retiredHeld;
+      if (rs.live !== expected) {
+        report('resource-live-mismatch', resource, expected, rs.live);
+      }
+    }
+    for (const quota of quotas.values()) {
+      let tableCount = 0;
+      for (const lease of leases.values()) {
+        if (lease.chain.includes(quota)) {
+          tableCount += 1;
+        }
+      }
+      let retiredHeld = 0;
+      for (const token of quota.retired.keys()) {
+        const lease = leases.get(token);
+        if (lease !== undefined && lease.chain.includes(quota)) {
+          retiredHeld += 1;
+        }
+      }
+      const expected = tableCount - retiredHeld;
+      if (quota.live !== expected) {
+        report('quota-live-mismatch', quota.id, expected, quota.live);
+      }
+    }
+
+    return {
+      ok: issues.length === 0,
+      checked: {
+        leases: leases.size,
+        resources: resourceNames.length,
+        quotas: quotas.size,
+        waits: pendingGroups.size,
+        epochs: epochs.size,
+      },
+      issues,
+    };
+  }
 
   function applyReplayQuota(entry) {
     const existing = quotas.get(entry.quota);

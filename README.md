@@ -41,6 +41,10 @@ Node.js 20 or newer. No runtime dependencies.
   `resource` carrying exactly the resource's last committed `epoch`; every
   other case throws `LeaseFencedError` (`code` `'LEASE_FENCED'`).
 - `Registry.stats() -> { granted, renewed, released, reclaimed, live }`.
+- `Registry.exportState(now = clock())` returns a read-only JSON snapshot of
+  the whole registry; see "State export and consistency self-check" below.
+- `Registry.checkConsistency(now = clock())` re-verifies every internal
+  invariant without repairing anything; see below.
 - `Registry.cancel(waitId) -> boolean` withdraws a still queued request.
 - `Registry.compact(now) -> { seq, leases }` folds the whole history into a
   crash-safe snapshot and restarts the event log from that point.
@@ -254,6 +258,45 @@ If an earlier append was interrupted mid-line, the unterminated fragment at
 the tail is treated as if it had never happened: entries are bounded by
 newlines, every complete line before the fragment stays in force, and the
 fragment is trimmed so the next append begins a clean line.
+
+### State export and consistency self-check
+
+`Registry.exportState(now = clock())` returns a plain JSON-shaped snapshot
+of the registry at the given reading (the injected clock when `now` is
+omitted; a non-finite `now` throws `TypeError`). The export is strictly
+read-only: it changes no state, deletes no expired credential and wakes no
+waiter, and the returned object shares no mutable structure with the
+registry. It always carries exactly `at`, `stats`, `quotas`, `resources`,
+`leases` and `waits`, with every array sorted by its primary key:
+
+- `stats`: `{ granted, renewed, released, reclaimed, live }`, the same
+  figures `stats()` would report at that reading.
+- `quotas`: `{ id, parentId, limit, used }` per declared quota, where `used`
+  is the number of live shares counted against the node at `now`.
+- `resources`: `{ resource, declared, capacity, quota, used, epoch, holder }`
+  per resource. Undeclared resources appear as single-capacity
+  (`capacity: 1`, `declared: false`, `quota: null`); every resource with a
+  lease, a queued wait or a historical epoch is listed, alongside every
+  declared resource.
+- `leases`: `{ token, resource, holder, expiresAt, ttlMs, epoch, live,
+  legacy }` per credential still in the table, including expired ones
+  nobody has swept yet; `live` is judged against `now`, and `legacy` marks
+  credentials recovered from the log (void for renew/release).
+- `waits`: `{ waitId, holder, resources, deadlineAt, status }` per request
+  still queued, with `resources` in the original demand order as
+  `{ resource, count }` rows and `status` either `waiting` or `timedOut`
+  (a queued request whose deadline has passed but that no operation has
+  purged yet).
+
+`Registry.checkConsistency(now = clock())` re-derives every invariant the
+registry maintains — token uniqueness, the lease/slot correspondence,
+capacity and per-level quota room, the epoch high-water marks, the wait
+queue wiring and the counter figures — and returns
+`{ ok, checked, issues }`. It never throws on an internal inconsistency and
+never repairs one: `checked` reports how many `leases`, `resources`,
+`quotas`, `waits` and `epochs` were reviewed, and when everything agrees
+`ok` is `true` and `issues` is empty. Otherwise `ok` is `false` and each
+issue pinpoints the violation as `{ kind, subject, expected, actual }`.
 
 ### Wait timeout organization
 
