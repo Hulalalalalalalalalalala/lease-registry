@@ -65,6 +65,21 @@ export class LogFileError extends Error {
 }
 LogFileError.code = 'LOG_FILE_ERROR';
 
+// Thrown by assertLease for every credential that is not the resource's
+// current fence: unknown resource or token, expired or released credentials,
+// credentials from an older epoch, and credentials that were voided by a
+// restart. The code is fixed, so callers can distinguish fencing from the
+// argument-shape TypeErrors without matching the message.
+export class LeaseFencedError extends Error {
+  constructor(resource) {
+    super(`lease for resource ${String(resource)} is fenced`);
+    this.name = 'LeaseFencedError';
+    this.code = LeaseFencedError.code;
+    this.resource = resource ?? null;
+  }
+}
+LeaseFencedError.code = 'LEASE_FENCED';
+
 // Binary min-heap ordered by (expiresAt, insertion order). Expiry heaps are
 // used three ways: one global heap drives reclamation, each resource gets one
 // for lazy capacity accounting, and each quota node gets one for lazy quota
@@ -232,6 +247,12 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
   // resource -> runtime bookkeeping. Created lazily; an undeclared resource
   // is a capacity-1 resource with no quota chain.
   const resourceStates = new Map();
+  // resource -> last committed credential epoch. A key appears on the first
+  // successful grant and never goes backwards or away: release, reclaim and a
+  // gap with no live lease all leave the number standing, and the next grant
+  // advances it by one, which is exactly the leader-takeover epoch of an
+  // exclusive resource.
+  const epochs = new Map();
   // quota id -> { id, parentId, limit, live, heap, resources }. `live` is the
   // current share occupation counted against the limit, maintained per share
   // grant and released lazily by the quota's own expiry heap.
@@ -892,6 +913,7 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
         granted: false,
         tokens: [],
         expiresAt: [],
+        epochList: [],
       };
       group.positions.push(position);
       let queue = waitQueues.get(row.resource);
@@ -925,7 +947,10 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
   // Plan every grant one request needs (one credential per demanded share),
   // touching no state. The caller commits only after all events are on disk.
   // batchId ties the credentials of one atomic batch together for replay.
-  function planGroupGrants(group, now, seqCursor) {
+  // The per-resource epoch cursor is threaded from outside: several plans in
+  // one cascade share it, so later plans assign epochs past the credentials an
+  // earlier plan is about to commit on the same resource.
+  function planGroupGrants(group, now, seqCursor, epochCursor) {
     const batchId = nextBatchId();
     const grants = [];
     let seq = seqCursor;
@@ -938,6 +963,9 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
         const minted = mintToken(now, seq);
         seq = minted.seq;
         const expiresAt = now + position.ttlMs;
+        const epoch = (epochCursor.get(position.resource)
+          ?? epochs.get(position.resource) ?? 0) + 1;
+        epochCursor.set(position.resource, epoch);
         grants.push({
           position,
           group,
@@ -947,6 +975,7 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
           token: minted.token,
           seq: minted.seq,
           expiresAt,
+          epoch,
           chain,
           event: {
             v: LOG_VERSION,
@@ -957,6 +986,7 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
             holder: group.holder,
             ttlMs: position.ttlMs,
             expiresAt,
+            epoch,
             requestId: group.requestId,
             batch: batchId,
           },
@@ -978,9 +1008,11 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
       legacy: false,
       heapSeq: 0,
       batch: batchId,
+      epoch: grant.epoch,
       chain: rs.chain,
     };
     leases.set(grant.token, lease);
+    epochs.set(grant.resource, grant.epoch);
     if (rs.capacity === 1) {
       dropStaleSlots(grant.resource, now);
     }
@@ -994,6 +1026,7 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
 
     grant.position.tokens.push(grant.token);
     grant.position.expiresAt.push(grant.expiresAt);
+    grant.position.epochList.push(grant.epoch);
   }
 
   function applyPlannedGrants(plan, now) {
@@ -1015,12 +1048,14 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
           holder: group.holder,
           token: position.tokens[i],
           expiresAt: position.expiresAt[i],
+          epoch: position.epochList[i],
         });
       }
     }
     if (group.single) {
       ticket.token = granted[0].token;
       ticket.expiresAt = granted[0].expiresAt;
+      ticket.epoch = granted[0].epoch;
     } else {
       // One credential per demanded share, each with its own expiry.
       ticket.leases = granted;
@@ -1217,6 +1252,10 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     }
 
     let seq = tokenSequence;
+    // Epoch cursors shared by every plan in this cascade: a later plan can
+    // take a resource an earlier plan vacated or fill a free share of one, and
+    // its credentials must carry epochs past the ones about to be committed.
+    const epochCursor = new Map();
     for (;;) {
       // Candidates are picked strictly by arrival order: the earliest
       // pending request whose batch is now complete wins, so no resource's
@@ -1236,7 +1275,7 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
       if (next === null) {
         break;
       }
-      const plan = planGroupGrants(next, now, seq);
+      const plan = planGroupGrants(next, now, seq, epochCursor);
       seq = plan.seq;
       plans.push(plan);
       planned.add(next);
@@ -1393,6 +1432,11 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
         const minted = mintToken(now, seq);
         seq = minted.seq;
         const expiresAt = now + ttlMsValue;
+        // One credential per demanded share, each a strictly greater epoch on
+        // its resource; a group demanding the same resource twice therefore
+        // commits two consecutive epochs in this single write.
+        const epoch = (epochs.get(row.resource) ?? 0) + 1;
+        epochs.set(row.resource, epoch);
         events.push({
           v: LOG_VERSION,
           type: 'acquire',
@@ -1402,6 +1446,7 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
           holder,
           ttlMs: ttlMsValue,
           expiresAt,
+          epoch,
           batch: batchId,
         });
         grants.push({
@@ -1409,11 +1454,32 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
           ttlMs: ttlMsValue,
           token: minted.token,
           expiresAt,
+          epoch,
           seq: minted.seq,
         });
       }
     });
-    appendEvents(events);
+    try {
+      appendEvents(events);
+    } catch (error) {
+      // The write never landed: roll the resource epochs back, one per share,
+      // before surfacing the failure. Epoch cursors only move for resources
+      // this batch itself advanced, so a retried attempt reuses the same
+      // numbers and the refusal never consumed an epoch.
+      const counts = new Map();
+      for (const row of rows) {
+        counts.set(row.resource, (counts.get(row.resource) ?? 0) + row.count);
+      }
+      for (const [resource, count] of counts) {
+        const current = epochs.get(resource) ?? 0;
+        if (current - count === 0) {
+          epochs.delete(resource);
+        } else {
+          epochs.set(resource, current - count);
+        }
+      }
+      throw error;
+    }
 
     tokenSequence = seq;
     const result = [];
@@ -1428,6 +1494,7 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
         legacy: false,
         heapSeq: 0,
         batch: batchId,
+        epoch: grant.epoch,
         chain: rs.chain,
         };
       leases.set(grant.token, lease);
@@ -1446,6 +1513,7 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
         holder,
         token: grant.token,
         expiresAt: grant.expiresAt,
+        epoch: grant.epoch,
       });
     }
     return result;
@@ -1785,6 +1853,7 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
         holder: lease.holder,
         expiresAt: lease.expiresAt,
         ttlMs: lease.ttlMs,
+        epoch: lease.epoch,
         batch: lease.batch ?? null,
         // Local tie-breaker for the sort below; stripped before writing.
         order: activeOrder.get(token) ?? 0,
@@ -1814,6 +1883,14 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
       }
     }
 
+    // The last committed epoch of every resource that ever held a lease,
+    // including resources with no live credential right now: restarting must
+    // not roll the leader epoch back to the credentials still in the table.
+    const epochEntries = [];
+    for (const [resource, epoch] of epochs.entries()) {
+      epochEntries.push({ resource, epoch });
+    }
+
     const snapshot = {
       v: SNAPSHOT_VERSION,
       type: 'snapshot',
@@ -1824,6 +1901,7 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
       counters: { ...counters },
       quotas: quotaEntries,
       resources: resourceEntries,
+      epochs: epochEntries,
       leases: leaseEntries,
     };
 
@@ -1880,7 +1958,57 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     stats,
     cancel,
     compact,
+    epoch,
+    assertLease,
   };
+
+  // Last committed credential epoch of a resource: 0 for a resource that was
+  // never granted, otherwise the epoch of the latest grant, even when no
+  // lease on it is currently live. The number never falls back after release
+  // or reclaim.
+  function epoch(resource) {
+    if (typeof resource !== 'string') {
+      throw new TypeError('resource must be a string');
+    }
+    return epochs.get(resource) ?? 0;
+  }
+
+  // Leader fence check. Returns true only when `token` names a live, current
+  // credential of `resource` and `epoch` is both that credential's epoch and
+  // the resource's last committed epoch. Every other situation - unknown
+  // resource, unknown token, an expired or released credential, an older
+  // epoch, a credential voided by a restart, or another holder's token -
+  // fences the caller with LeaseFencedError. Malformed arguments are
+  // TypeErrors, so a fence can never be confused with a bad call.
+  function assertLease(resource, token, epochValue) {
+    if (typeof resource !== 'string') {
+      throw new TypeError('resource must be a string');
+    }
+    if (typeof token !== 'string') {
+      throw new TypeError('token must be a string');
+    }
+    if (!Number.isInteger(epochValue) || !Number.isFinite(epochValue)) {
+      throw new TypeError('epoch must be a finite integer');
+    }
+    if (!epochs.has(resource)) {
+      throw new LeaseFencedError(resource);
+    }
+    if (epochs.get(resource) !== epochValue) {
+      throw new LeaseFencedError(resource);
+    }
+    const lease = leases.get(token);
+    const now = clock();
+    if (
+      lease === undefined ||
+      lease.legacy ||
+      lease.resource !== resource ||
+      lease.epoch !== epochValue ||
+      lease.expiresAt <= now
+    ) {
+      throw new LeaseFencedError(resource);
+    }
+    return true;
+  }
 
   function applyReplayQuota(entry) {
     const existing = quotas.get(entry.quota);
@@ -2077,7 +2205,8 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
       (value.batchSeq !== undefined &&
         (!Number.isInteger(value.batchSeq) || value.batchSeq < 0)) ||
       (value.quotas !== undefined && !Array.isArray(value.quotas)) ||
-      (value.resources !== undefined && !Array.isArray(value.resources))
+      (value.resources !== undefined && !Array.isArray(value.resources)) ||
+      (value.epochs !== undefined && !Array.isArray(value.epochs))
     ) {
       throw new LogFileError(`corrupt lease snapshot at ${snapshotPath}`);
     }
@@ -2130,13 +2259,32 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
         }
       }
     }
+    if (value.epochs !== undefined) {
+      const epochResources = new Set();
+      for (const entry of value.epochs) {
+        if (
+          entry === null ||
+          typeof entry !== 'object' ||
+          entry.resource === null || entry.resource === undefined ||
+          !Number.isInteger(entry.epoch) || entry.epoch <= 0
+        ) {
+          throw new LogFileError(`corrupt lease snapshot epoch at ${snapshotPath}`);
+        }
+        if (epochResources.has(entry.resource)) {
+          throw new LogFileError(`duplicate epoch in snapshot at ${snapshotPath}`);
+        }
+        epochResources.add(entry.resource);
+      }
+    }
     for (const entry of value.leases) {
       if (
         entry === null ||
         typeof entry !== 'object' ||
         typeof entry.token !== 'string' ||
         !Number.isFinite(entry.ttlMs) ||
-        !Number.isFinite(entry.expiresAt)
+        !Number.isFinite(entry.expiresAt) ||
+        (entry.epoch !== undefined &&
+          (!Number.isInteger(entry.epoch) || entry.epoch <= 0))
       ) {
         throw new LogFileError(`corrupt lease snapshot lease at ${snapshotPath}`);
       }
@@ -2163,8 +2311,34 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
       applyReplayResource(entry);
     }
 
+    // Last committed epoch of every resource, including ones with no live
+    // lease. Images written before epochs existed omit the list; the lease
+    // entries below then provide a best-effort floor (their credentials are
+    // legacy and can never fence, only the next grant's starting point
+    // matters).
+    if (Array.isArray(snapshot.epochs)) {
+      for (const entry of snapshot.epochs) {
+        epochs.set(entry.resource, entry.epoch);
+      }
+    }
+    // Fallback cursor for lease entries without a recorded epoch (old
+    // images): credentials are kept in table order, so numbering is stable
+    // even though the true grant order is long gone.
+    const legacyEpochCursor = new Map();
+
     for (const entry of snapshot.leases) {
       const rs = resourceStates.get(entry.resource) ?? resourceStateFor(entry.resource);
+      let leaseEpoch;
+      if (Number.isInteger(entry.epoch) && entry.epoch > 0) {
+        leaseEpoch = entry.epoch;
+      } else {
+        leaseEpoch = (legacyEpochCursor.get(entry.resource) ?? 0) + 1;
+        legacyEpochCursor.set(entry.resource, leaseEpoch);
+      }
+      // The recorded high-water mark can never sit below a live credential.
+      if ((epochs.get(entry.resource) ?? 0) < leaseEpoch) {
+        epochs.set(entry.resource, leaseEpoch);
+      }
       const lease = {
         resource: entry.resource,
         holder: entry.holder,
@@ -2175,9 +2349,10 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
         // release them.
         legacy: true,
         heapSeq: 0,
+        epoch: leaseEpoch,
         batch: entry.batch ?? null,
         chain: rs.chain,
-        };
+      };
       leases.set(entry.token, lease);
       addSlot(entry.resource, entry.token);
       knownTokens.add(entry.token);
@@ -2289,7 +2464,9 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
         if (
           typeof event.token !== 'string' ||
           !Number.isFinite(event.ttlMs) ||
-          !Number.isFinite(event.expiresAt)
+          !Number.isFinite(event.expiresAt) ||
+          (event.epoch !== undefined &&
+            (!Number.isInteger(event.epoch) || event.epoch <= 0))
         ) {
           throw new LogFileError(
             `corrupt acquire entry on line ${lineNumber} of ${logPath}`,
@@ -2300,6 +2477,20 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
         // only slots held by a different batch count as the stale lease being
         // retaken. Share resources keep every coexisting credential.
         const rs = resourceStateFor(event.resource);
+        // New logs carry the committed epoch and it must follow the last one
+        // for this resource exactly; a gap or a step backwards is corruption.
+        // Old logs predate epochs, so the cursor is simply continued.
+        const expectedEpoch = (epochs.get(event.resource) ?? 0) + 1;
+        let leaseEpoch;
+        if (event.epoch === undefined) {
+          leaseEpoch = expectedEpoch;
+        } else if (event.epoch !== expectedEpoch) {
+          throw new LogFileError(
+            `non-consecutive lease epoch on line ${lineNumber} of ${logPath}`,
+          );
+        } else {
+          leaseEpoch = event.epoch;
+        }
         if (event.batch !== undefined && event.batch !== null) {
           const logged = /^batch-[^-]+-(\d+)$/.exec(String(event.batch));
           if (logged !== null) {
@@ -2352,9 +2543,11 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
           // release them.
           legacy: true,
           heapSeq: 0,
+          epoch: leaseEpoch,
           batch: event.batch ?? null,
           chain: rs.chain,
             };
+        epochs.set(event.resource, leaseEpoch);
         leases.set(event.token, lease);
         addSlot(event.resource, event.token);
         replayBatchTokens.add(event.token);

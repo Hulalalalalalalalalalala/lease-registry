@@ -298,6 +298,7 @@ test('queueing without a wait budget keeps the exact baseline return shape', () 
     holder: 'a',
     token: lease.token,
     expiresAt: 50,
+    epoch: 1,
   });
 });
 

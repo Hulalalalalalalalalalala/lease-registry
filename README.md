@@ -17,7 +17,7 @@ Node.js 20 or newer. No runtime dependencies.
 ## Public interface
 
 `createRegistry({ ttlMs, clock = Date.now, logPath = null }) -> Registry`.
-- `Registry.acquire(resource, holder, ttlMs) -> { resource, holder, token, expiresAt }`.
+- `Registry.acquire(resource, holder, ttlMs) -> { resource, holder, token, expiresAt, epoch }`.
   Passing an array of resources as the first argument is the atomic group
   form, identical to `acquireAll`.
 - `Registry.acquireAll(resources, holder, ttlMs, waitMs)` (aliases
@@ -39,6 +39,14 @@ Node.js 20 or newer. No runtime dependencies.
   "Shareable resources and hierarchical quotas" below.
 - `Registry.setQuota(quotaId, limit, parentId)` registers a
   quota node or changes an existing node's limit; see below.
+- `Registry.epoch(resource) -> number` returns the resource's last committed
+  credential epoch (0 if it was never granted); see "Lease epochs and leader
+  fencing" below.
+- `Registry.assertLease(resource, token, epoch) -> true` validates a current
+  credential against the leader fence, throwing `LeaseFencedError` otherwise;
+  see below.
+- `LeaseFencedError` exported class carrying the fixed `code`
+  `'LEASE_FENCED'`, plus the `resource` field.
 - `LeaseTakenError` exported class carrying a `code` property.
 - `QuotaExceededError` exported class carrying a `code` property
   (`'QUOTA_EXCEEDED'`), plus `quota`, `holder`, `requested` and
@@ -54,7 +62,7 @@ Node.js 20 or newer. No runtime dependencies.
 
 On success it returns one lease per listed occurrence, in list order, each
 with its own credential and its own absolute expiry:
-`[{ resource, holder, token, expiresAt }, ...]`. `ttlMs` may be one number
+`[{ resource, holder, token, expiresAt, epoch }, ...]`. `ttlMs` may be one number
 applied to every occurrence or one ttl per listed resource. A resource may
 be listed more than once; each occurrence is treated as a separate demand
 and receives its own credential — the holder then owns that resource once
@@ -95,7 +103,7 @@ the call queues instead of throwing and returns a waiting result
 counter and writes no log line. Waiters for one resource are served in FIFO
 order: a lease freed by `release` or reclaimed by `sweep` goes straight to
 the head of that resource's queue, and the woken ticket then reads
-`{ status: 'granted', resource, holder, waitId, token, expiresAt }` with its
+`{ status: 'granted', resource, holder, waitId, token, expiresAt, epoch }` with its
 own fresh expiry. A waiter whose budget runs out — judged by the injected
 clock — gives up: its ticket reads `status: 'expired'` and it is never
 woken. `Registry.cancel(waitId) -> boolean` drops a still queued request and
@@ -226,3 +234,53 @@ sweep reclaims that share as the next grant. Freed shares
 fund waiting requests at the head of that resource's queue, and a
 share freed on a different resource under the same quota wakes them in strict
 arrival order.
+
+## Lease epochs and leader fencing
+
+Every credential carries an **epoch**: a strictly increasing integer on its
+resource, beginning at 1 for the resource's first successful grant and
+increasing by exactly one per committed credential. A successful `acquire`
+returns `epoch` on its result, and every credential of a successful
+`acquireAll` array (and every granted wait ticket's lease) carries the epoch
+it committed:
+
+- first grant: 1;
+- re-acquisition after a previous holder's `release` or after a `sweep`:
+  the next number, including when the same holder takes the resource again;
+- a grant that wakes a queued request: the next number;
+- each demanded share of a shared resource and each repeated occurrence in
+  an atomic group: its own consecutive epoch, all committed together.
+
+Nothing else moves an epoch: `renew` only extends `expiresAt`; a failed
+contention (`LeaseTakenError`), a quota refusal (`QuotaExceededError`),
+queueing, wait timeout, `cancel`, a failed log write, and a rejected or
+partially failed group never consume one. `acquireAll` advances the epochs of
+all involved resources at once only when the whole group commits; a rejected
+group leaves every epoch exactly where it was.
+
+`Registry.epoch(resource) -> number` reads the last committed epoch: 0 for a
+resource that was never granted, otherwise the high-water mark. The number
+never rolls back after `release` or `sweep`, even while no lease on the
+resource is currently live. On an exclusive resource the last committed epoch
+is exactly the current leader's takeover epoch.
+
+`Registry.assertLease(resource, token, epoch) -> true` is the leader fence:
+it returns `true` only when `token` names a resource's currently live
+credential and `epoch` is both that credential's epoch and the resource's
+last committed epoch. It throws `LeaseFencedError`
+(`code: 'LEASE_FENCED'`) for an unknown resource, an unknown token, an
+expired or released credential, an older or newer epoch, another holder's
+token, and for credentials voided by a restart (they keep occupying but can
+no longer fence). Non-string `resource` or `token`, or a non-finite-integer
+`epoch`, raises `TypeError`; `0` is a well-formed epoch and fences (it cannot
+match a resource that was ever granted).
+
+When `logPath` is set, each grant's epoch is written atomically with its
+acquire event, and the snapshot records every resource's last committed
+epoch, including resources with no live lease. Epochs recover identically
+after restart and compaction without re-advancing; a log record whose epoch
+is not exactly the next expected number, or a malformed snapshot epoch
+table, is treated as corruption and throws `LogFileError`. Logs and snapshots
+written before epochs existed are still accepted: the missing epochs are
+reconstructed sequentially. With `logPath = null` everything stays purely
+in-memory.
