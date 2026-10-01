@@ -28,6 +28,10 @@ Node.js 20 or newer. No runtime dependencies.
   hierarchical quotas" below.
 - `Registry.renew(token) -> boolean` extends a lease that is still live.
 - `Registry.release(token) -> boolean` ends a lease early.
+- `Registry.transfer(token, holder, ttlMs = undefined) ->
+  { resource, holder, token, expiresAt, epoch }` hands a live exclusive
+  lease straight from its current holder to a new one without an unowned
+  gap; see "Lease transfer" below.
 - `Registry.sweep(now) -> string[]` reclaims expired leases and names the resources it freed, ordered by expiry time.
 - `Registry.holder(resource) -> string | null` reports the current holder.
 - `Registry.epoch(resource) -> number` reports the resource's last committed
@@ -90,6 +94,51 @@ credentials across restart and compaction; recovery never advances an
 epoch a second time. On a share resource several live credentials coexist
 with distinct epochs, and only the one carrying the resource's last epoch
 passes the fence.
+
+### Lease transfer
+
+`Registry.transfer(token, holder, ttlMs = undefined)` lets the current
+holder of an exclusive resource hand it straight to a new holder, so the
+resource passes over without the unowned gap a `release` followed by an
+`acquire` would leave. `token` must be a live, current credential of an
+exclusive (single-occupancy) resource minted by this process; `holder`
+must be a non-empty string; `ttlMs` omits to the registry default TTL and
+otherwise must be a positive finite number.
+
+On success the old credential is fenced at once — `renew` and `release`
+return `false` for it and `assertLease(resource, oldToken, oldEpoch)`
+throws `LeaseFencedError` — while a freshly minted credential takes over
+the same share. The result is
+`{ resource, holder, token, expiresAt, epoch }`: `expiresAt` is the
+registry clock reading at the call plus the effective TTL, and `epoch` is
+exactly one past the resource's previous epoch. The new token passes
+`assertLease(resource, newToken, newEpoch)` and renews, releases and
+expires like any other credential. Transferring to the same holder name
+is allowed and still mints a new epoch, fencing the old credential.
+
+A token that is unknown, already released, reclaimed, expired, issued
+before a restart, attached to a shareable resource, or no longer the
+resource's current credential makes `transfer` throw `LeaseFencedError`
+(with its fixed `code`); a non-string `token` or `holder`, an empty
+`holder`, or a non-positive/non-finite `ttlMs` throws `TypeError`.
+
+A transfer never frees a share, so it does not wake or reorder waiters:
+pending requests, queue positions, ticket states and FIFO wakeups are all
+unchanged, and the head waiter is woken only when the new credential is
+later released or reclaimed. One credential of an atomic group can be
+transferred on its own with no effect on the group's other credentials.
+No public counter moves — `granted`, `renewed`, `released` and
+`reclaimed` stay put and `live` is 1 both immediately before and after.
+
+When `logPath` is set a transfer appends exactly one `transfer` event
+that commits the old credential, the new credential and the new epoch
+together. If the append fails, the call throws `LogFileError` and changes
+nothing: the old credential can still `renew`, `release` and
+`assertLease`, the new token never exists, and the epoch and stats do not
+move. Replay and compaction preserve the new/old credential relationship
+(the transferred lease keeps occupying with its absolute expiry and
+epoch), credentials issued before the restart stay void exactly as after
+any recovery, and a later grant continues from the transferred epoch.
 
 ### Atomic groups
 
@@ -157,9 +206,12 @@ of a live queue. Only the eventual grant is written to the log (in the same
 write as the release or reclaim that triggered it), so queued requests do
 not survive a restart.
 
-When `logPath` points at a file, every grant, renewal, early release and
+When `logPath` points at a file, every grant, renewal, early release,
+handover and
 reclaim is appended to it as one JSON line; each acquire line carries the
-credential epoch atomically with the grant. On startup the history is replayed
+credential epoch atomically with the grant, and each transfer line
+commits the fenced old credential, the new credential and the new epoch
+in one event. On startup the history is replayed
 in order, so unexpired leases keep occupying their resources, the four
 cumulative counters come back exactly as they were, and every resource's
 last committed epoch comes back exactly as it stood; replay itself adds no

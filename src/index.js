@@ -13,12 +13,12 @@
 //
 // Every resource keeps a credential epoch, starting at 1 on its first grant
 // and advanced by exactly one per committed credential (retake, same-holder
-// reacquisition and woken grants included). Renewals never advance it, nor do
-// failed, queued, timed-out, cancelled or partially committed requests; it
-// never moves backwards and survives restarts and compactions. The newest
-// credential of an exclusive resource is therefore the leader epoch, and
-// assertLease is the fence a holder passes only while it still is that
-// leader.
+// reacquisition, holder handover via transfer and woken grants included).
+// Renewals never advance it, nor do failed, queued, timed-out, cancelled or
+// partially committed requests; it never moves backwards and survives
+// restarts and compactions. The newest credential of an exclusive resource
+// is therefore the leader epoch, and assertLease is the fence a holder
+// passes only while it still is that leader.
 //
 // Persistence layout:
 //   <logPath>           append-only event log, one JSON object per line
@@ -274,6 +274,9 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     renewed: 0,
     released: 0,
     reclaimed: 0,
+    // Handover credential events; not one of the five public stats fields,
+    // but cumulative like the others so it survives restart and compaction.
+    transferred: 0,
   };
 
   // Per-instance identity makes tokens unique across registries living in the
@@ -1656,6 +1659,95 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     return true;
   }
 
+  // Hand a live exclusive lease straight from its current holder to a new
+  // one without an unowned gap: the old credential is fenced and a fresh
+  // credential carrying epoch + 1 takes over the very same share. Nothing
+  // is freed, so no waiter is planned or woken; wait queues, tickets and
+  // FIFO order are untouched, and no public counter (granted, renewed,
+  // released, reclaimed) moves. A single transfer event commits the old
+  // credential, the new credential and the epoch in one append: a failed
+  // write leaves the old credential fully valid and never mints the new
+  // one.
+  function transfer(token, holder, ttlMs = undefined) {
+    if (typeof token !== 'string') {
+      throw new TypeError('token must be a string');
+    }
+    if (typeof holder !== 'string' || holder.length === 0) {
+      throw new TypeError('holder must be a non-empty string');
+    }
+    const effectiveTtl = ttlMs === undefined ? defaultTtlMs : ttlMs;
+    if (!Number.isFinite(effectiveTtl) || effectiveTtl <= 0) {
+      throw new TypeError('ttlMs must be a positive finite number');
+    }
+    const lease = leases.get(token);
+    const now = clock();
+    // Fence every credential that is not the live leader of an exclusive
+    // resource: unknown, released or reclaimed tokens have no record; a
+    // replayed one is legacy; an expired one is past its reading; a share
+    // resource credential is not transferable (shares are never handed
+    // over); and any record not carrying the resource's last epoch is an
+    // older, superseded credential.
+    const rs = lease === undefined ? undefined : resourceStates.get(lease.resource);
+    if (
+      lease === undefined ||
+      lease.legacy ||
+      lease.expiresAt <= now ||
+      rs === undefined ||
+      rs.capacity !== 1 ||
+      lease.epoch !== (epochs.get(lease.resource) ?? 0)
+    ) {
+      throw new LeaseFencedError(lease === undefined ? null : lease.resource);
+    }
+    const resource = lease.resource;
+    const newEpoch = lease.epoch + 1;
+    // Pure candidate like every grant: nothing is consumed until the event
+    // is safely on disk.
+    const minted = mintToken(now, tokenSequence);
+    const expiresAt = now + effectiveTtl;
+    appendEvent({
+      v: LOG_VERSION,
+      type: 'transfer',
+      at: now,
+      resource,
+      from: token,
+      token: minted.token,
+      holder,
+      ttlMs: effectiveTtl,
+      expiresAt,
+      epoch: newEpoch,
+    });
+
+    // Committed: replace the occupant in place. Owner usage nets to zero -
+    // the share stays occupied throughout - and an exclusive resource can
+    // carry no other live occupant beside the leader, so the slot set stays
+    // a singleton.
+    tokenSequence = minted.seq;
+    knownTokens.add(minted.token);
+    retirePermanent(lease);
+    leases.delete(token);
+    removeSlot(resource, token);
+    const newLease = {
+      resource,
+      holder,
+      expiresAt,
+      ttlMs: effectiveTtl,
+      legacy: false,
+      heapSeq: 0,
+      epoch: newEpoch,
+      chain: lease.chain,
+    };
+    leases.set(minted.token, newLease);
+    epochs.set(resource, newEpoch);
+    addSlot(resource, minted.token);
+    rs.live += 1;
+    for (const quota of lease.chain) {
+      quota.live += 1;
+    }
+    pushLeaseHeaps(minted.token, newLease);
+    counters.transferred += 1;
+    return { resource, holder, token: minted.token, expiresAt, epoch: newEpoch };
+  }
+
   // Cancelling only lands on a request that is still queued: an already
   // woken, expired or cancelled request reports false, as does an unknown id.
   function cancel(requestId) {
@@ -1982,6 +2074,7 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     setQuota,
     renew,
     release,
+    transfer,
     sweep,
     holder,
     epoch,
@@ -2197,6 +2290,12 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
         throw new LogFileError(`corrupt lease snapshot counters at ${snapshotPath}`);
       }
     }
+    if (
+      value.counters.transferred !== undefined &&
+      !Number.isFinite(value.counters.transferred)
+    ) {
+      throw new LogFileError(`corrupt lease snapshot counters at ${snapshotPath}`);
+    }
     if (value.quotas !== undefined) {
       const quotaIds = new Set();
       for (const entry of value.quotas) {
@@ -2279,6 +2378,11 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     counters.renewed = snapshot.counters.renewed;
     counters.released = snapshot.counters.released;
     counters.reclaimed = snapshot.counters.reclaimed;
+    // Internal handover tally; absent from images written before transfers
+    // existed, and folded transfer events below do not replay it back.
+    counters.transferred = Number.isFinite(snapshot.counters.transferred)
+      ? snapshot.counters.transferred
+      : 0;
     replayMaxEventSeq = snapshot.seq;
     replayMaxTokenSeq = snapshot.tokenSeq ?? 0;
     replayMaxBatchSeq = snapshot.batchSeq ?? 0;
@@ -2584,6 +2688,81 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
           removeSlot(lease.resource, event.token);
         }
         counters.released += 1;
+        break;
+      }
+      case 'transfer': {
+        if (
+          event.resource === null || event.resource === undefined ||
+          typeof event.from !== 'string' ||
+          typeof event.token !== 'string' ||
+          typeof event.holder !== 'string' ||
+          event.holder.length === 0 ||
+          !Number.isFinite(event.ttlMs) ||
+          event.ttlMs <= 0 ||
+          !Number.isFinite(event.expiresAt) ||
+          !Number.isInteger(event.epoch) ||
+          event.epoch <= 0
+        ) {
+          throw new LogFileError(
+            `corrupt transfer entry on line ${lineNumber} of ${logPath}`,
+          );
+        }
+        // Only an exclusive resource can carry a transfer event.
+        const rs = resourceStateFor(event.resource);
+        if (rs.capacity !== 1) {
+          throw new LogFileError(
+            `transfer entry for a share resource on line ${lineNumber} of ${logPath}`,
+          );
+        }
+        // The handover commits one new credential epoch, exactly like a
+        // grant: it must be exactly one past the recovered epoch.
+        const expectedEpoch = (epochs.get(event.resource) ?? 0) + 1;
+        if (event.epoch !== expectedEpoch) {
+          throw new LogFileError(
+            `non-monotonic lease epoch on line ${lineNumber} of ${logPath}`,
+          );
+        }
+        // The new credential belongs to no acquire batch; reset batch
+        // bookkeeping so a later acquire replays its batches cleanly.
+        replayBatchId = null;
+        replayBatchTokens = new Set();
+        // Structural supersede of the old credential: vacate its slot and
+        // drop its heap nodes from every owner, exactly like an in-process
+        // retake.
+        const oldLease = leases.get(event.from);
+        if (oldLease !== undefined) {
+          removeHeapNodes(rs.heap, event.from);
+          for (const quota of oldLease.chain) {
+            removeHeapNodes(quota.heap, event.from);
+          }
+          retirePermanent(oldLease);
+          leases.delete(event.from);
+          removeSlot(event.resource, event.from);
+        }
+        const lease = {
+          resource: event.resource,
+          holder: event.holder,
+          expiresAt: event.expiresAt,
+          ttlMs: event.ttlMs,
+          // Credentials issued before this process started are void: the
+          // lease keeps occupying its share, but its token cannot renew or
+          // release it.
+          legacy: true,
+          heapSeq: 0,
+          epoch: event.epoch,
+          batch: null,
+          chain: rs.chain,
+        };
+        leases.set(event.token, lease);
+        addSlot(event.resource, event.token);
+        knownTokens.add(event.token);
+        epochs.set(event.resource, event.epoch);
+        rs.live += 1;
+        for (const quota of rs.chain) {
+          quota.live += 1;
+        }
+        pushLeaseHeaps(event.token, lease);
+        counters.transferred += 1;
         break;
       }
       case 'reclaim': {
