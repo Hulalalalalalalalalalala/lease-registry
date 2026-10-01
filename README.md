@@ -17,7 +17,7 @@ Node.js 20 or newer. No runtime dependencies.
 ## Public interface
 
 `createRegistry({ ttlMs, clock = Date.now, logPath = null }) -> Registry`.
-- `Registry.acquire(resource, holder, ttlMs) -> { resource, holder, token, expiresAt }`.
+- `Registry.acquire(resource, holder, ttlMs) -> { resource, holder, token, expiresAt, epoch }`.
   Passing an array of resources as the first argument is the atomic group
   form, identical to `acquireAll`.
 - `Registry.acquireAll(resources, holder, ttlMs, waitMs)` (aliases
@@ -30,6 +30,12 @@ Node.js 20 or newer. No runtime dependencies.
 - `Registry.release(token) -> boolean` ends a lease early.
 - `Registry.sweep(now) -> string[]` reclaims expired leases and names the resources it freed, ordered by expiry time.
 - `Registry.holder(resource) -> string | null` reports the current holder.
+- `Registry.epoch(resource) -> number` reports the resource's last committed
+  credential epoch (0 before its first grant; it never moves backwards).
+- `Registry.assertLease(resource, token, epoch) -> true` is the leader fence:
+  it returns true only when `token` is a current, live credential of
+  `resource` carrying exactly the resource's last committed `epoch`; every
+  other case throws `LeaseFencedError` (`code` `'LEASE_FENCED'`).
 - `Registry.stats() -> { granted, renewed, released, reclaimed, live }`.
 - `Registry.cancel(waitId) -> boolean` withdraws a still queued request.
 - `Registry.compact(now) -> { seq, leases }` folds the whole history into a
@@ -44,6 +50,46 @@ Node.js 20 or newer. No runtime dependencies.
   (`'QUOTA_EXCEEDED'`), plus `quota`, `holder`, `requested` and
   `available` fields.
 - `LogFileError` exported class carrying a `code` property (`'LOG_FILE_ERROR'`).
+- `LeaseFencedError` exported class carrying a `code` property
+  (`'LEASE_FENCED'`) and the `resource` it fences.
+
+### Lease epochs and leader fencing
+
+Every resource has a credential epoch that starts at 1 on its first
+successful grant and advances by exactly one on each later committed
+credential. The epoch is returned on every successful acquisition — the
+single result of `acquire` carries `epoch`, and each credential in an
+`acquireAll` success array carries its own — and a retake always produces a
+larger epoch: whether the previous holder called `release`, its lease was
+reclaimed by `sweep`, the same holder takes the resource over again, or a
+queued request is woken into it. `renew` only extends `expiresAt` and never
+moves the epoch; a failed contention (`LeaseTakenError` or
+`QuotaExceededError`), queueing, a wait timeout, a `cancel`, a failed log
+write and a partially blocked group request consume no epoch. On an
+exclusive resource the credential epoch is the leader-takeover epoch: a
+client that saw epoch `n` knows it has been superseded as soon as a later
+epoch exists.
+
+`Registry.epoch(resource)` returns the last committed epoch — 0 before the
+resource was ever granted, and still the last epoch when no lease is
+currently live; it never rolls back on release, reclaim, expiry or restart.
+
+`Registry.assertLease(resource, token, epoch)` is the leader fence. It
+returns `true` only when `token` is a current, live credential of
+`resource` minted by this process and carrying exactly the resource's last
+committed epoch. An unknown resource, an unknown token, a released,
+reclaimed or expired credential, a credential from before a restart,
+another holder's (or another resource's) credential, or any epoch argument
+other than the current one throws `LeaseFencedError` with the fixed code
+`LEASE_FENCED`; a non-string `resource` or `token`, or a non-finite-integer
+`epoch`, throws `TypeError`.
+
+Epochs are written atomically with their grant events when `logPath` is
+set and are restored consistently with the live leases, counters and
+credentials across restart and compaction; recovery never advances an
+epoch a second time. On a share resource several live credentials coexist
+with distinct epochs, and only the one carrying the resource's last epoch
+passes the fence.
 
 ### Atomic groups
 
@@ -54,7 +100,11 @@ Node.js 20 or newer. No runtime dependencies.
 
 On success it returns one lease per listed occurrence, in list order, each
 with its own credential and its own absolute expiry:
-`[{ resource, holder, token, expiresAt }, ...]`. `ttlMs` may be one number
+`[{ resource, holder, token, expiresAt, epoch }, ...]`. Each occurrence
+carries the credential epoch its resource handed out for it — consecutive
+occurrences of the same resource get consecutive epochs, and the whole
+group advances every involved resource's epoch exactly once, only when the
+whole batch commits. `ttlMs` may be one number
 applied to every occurrence or one ttl per listed resource. A resource may
 be listed more than once; each occurrence is treated as a separate demand
 and receives its own credential — the holder then owns that resource once
@@ -72,7 +122,8 @@ earlier request on any resource, and a later request never overtakes the
 group. The request is woken only once every listed position reaches the head
 of its queue and the corresponding resource is free; its ticket then reads
 `{ status: 'granted', resources, holder, waitId, leases }` with the same
-lease array a direct success returns, each lease expiring independently from
+lease array a direct success returns (each credential carrying its
+`epoch`), each lease expiring independently from
 the wake instant. A single free (release or reclaim) wakes whole batches in
 arrival order, cascading across resources in the same operation.
 
@@ -95,8 +146,8 @@ the call queues instead of throwing and returns a waiting result
 counter and writes no log line. Waiters for one resource are served in FIFO
 order: a lease freed by `release` or reclaimed by `sweep` goes straight to
 the head of that resource's queue, and the woken ticket then reads
-`{ status: 'granted', resource, holder, waitId, token, expiresAt }` with its
-own fresh expiry. A waiter whose budget runs out — judged by the injected
+`{ status: 'granted', resource, holder, waitId, token, expiresAt, epoch }`
+with its own fresh expiry. A waiter whose budget runs out — judged by the injected
 clock — gives up: its ticket reads `status: 'expired'` and it is never
 woken. `Registry.cancel(waitId) -> boolean` drops a still queued request and
 reports `true`; already granted, expired, cancelled or unknown requests
@@ -107,20 +158,26 @@ write as the release or reclaim that triggered it), so queued requests do
 not survive a restart.
 
 When `logPath` points at a file, every grant, renewal, early release and
-reclaim is appended to it as one JSON line. On startup the history is replayed
-in order, so unexpired leases keep occupying their resources and the four
-cumulative counters come back exactly as they were; replay itself adds no
-counts. Credentials issued before the restart are all void: renewing or
-releasing them returns `false`, though the leases they pointed at stay live
-until they expire. A missing log file starts an empty registry; a corrupt
-line or an unrecognized log version throws `LogFileError`. If appending an
-event fails, the operation does not take effect and registry state is rolled
-back to before the call. With `logPath = null` nothing is persisted.
+reclaim is appended to it as one JSON line; each acquire line carries the
+credential epoch atomically with the grant. On startup the history is replayed
+in order, so unexpired leases keep occupying their resources, the four
+cumulative counters come back exactly as they were, and every resource's
+last committed epoch comes back exactly as it stood; replay itself adds no
+counts and advances no epoch. Credentials issued before the restart are all
+void: renewing or releasing them returns `false`, asserting them throws
+`LeaseFencedError`, though the leases they pointed at stay live until they
+expire. A missing log file starts an empty registry; a corrupt line, an
+unrecognized log version, or a non-monotonic/missing epoch throws
+`LogFileError`. If appending an event fails, the operation does not take
+effect and registry state is rolled back to before the call. With
+`logPath = null` nothing is persisted.
 
 ### Snapshots and compaction
 
 `compact(now)` writes one snapshot containing, for every lease still alive in
-the table, its resource, holder, absolute expiry and ttl, together with the
+the table, its resource, holder, absolute expiry, ttl and credential epoch,
+the last committed epoch of every resource ever granted (including ones with
+no live lease), together with the
 four cumulative counters and the internal id high-water marks; queued wait
 requests are deliberately not part of it. The snapshot goes to
 `<logPath>.snapshot` and the log is then restarted with a boundary marker.
@@ -132,9 +189,10 @@ applies every event exactly once: folded events are recognized by their
 sequence numbers and skipped.
 
 On startup the registry loads the snapshot first and replays only the
-incremental events written after it. Ownership, every credential's expiry and
-all four counters come back item-for-item identical to a replay of the
-uncompacted log; rebuilding adds no counts, and credentials issued before
+incremental events written after it. Ownership, every credential's expiry,
+all four counters and every resource epoch come back item-for-item
+identical to a replay of the uncompacted log; rebuilding adds no counts,
+and credentials issued before
 compaction are void exactly like credentials issued before any restart.
 Queued requests never survive: after recovery the wait queues are empty and
 a grant can only be triggered by a request that queued afterwards.
