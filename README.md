@@ -27,6 +27,8 @@ Node.js 20 or newer. No runtime dependencies.
   one resource in one atomic request; see "Shareable resources and
   hierarchical quotas" below.
 - `Registry.renew(token) -> boolean` extends a lease that is still live.
+- `Registry.renewAll(tokens) -> boolean` renews a whole batch of leases at
+  one heartbeat; see "Atomic batch renewal" below.
 - `Registry.release(token) -> boolean` ends a lease early.
 - `Registry.transfer(token, holder, ttlMs = undefined) ->
   { resource, holder, token, expiresAt, epoch }` hands a live exclusive
@@ -142,6 +144,49 @@ new token exists, and the epoch and counters never moved. Replay and
 compaction preserve the old/new credential relationship exactly; both
 credentials are void after a restart, as with every recovered credential.
 
+### Atomic batch renewal
+
+`Registry.renewAll(tokens)` lets one synchronized heartbeat renew a set of
+leases together: either every named credential is renewed, or none of them
+changes. `tokens` must be a non-empty array of distinct non-empty strings;
+a non-array, an empty array, an empty slot, a non-string or empty-string
+element, or a repeated token all throw `TypeError`, and input validation
+runs before any existence judgment. The tokens may come from different
+batches and holders and may name different shares of one shared resource;
+a credential does not need to carry its resource's latest epoch.
+
+After the input is accepted the injected clock is read exactly once (a
+non-finite reading throws `TypeError`; a backwards reading is judged
+exactly as given), and a credential counts as live only when its
+`expiresAt` is strictly greater than that reading. The whole batch is
+checked for liveness before any new deadline is computed; if one resulting
+deadline is not a finite number the call throws `TypeError`. If any token
+is unknown, belongs to another instance, was minted before a restart, was
+released, reclaimed, replaced by a transfer, or has already expired, the
+whole call returns `false`.
+
+On success every lease keeps its `token`, `holder`, `ttlMs` and `epoch`,
+and each one's `expiresAt` becomes the single clock reading plus its own
+`ttlMs`; the `renewed` counter moves by the number of tokens and the other
+cumulative counters stay put. A failed batch changes no lease, counter,
+waiting ticket or log line; a successful batch never cleans up, wakes or
+reorders the wait queue either — renewal moves no share. `exportState`
+shows every new deadline at once, `checkConsistency` stays `ok`, and a
+later `sweep` reclaims by the new deadlines; shares freed afterwards fund
+the existing wait queue exactly as before.
+
+When `logPath` is set the batch is appended as one indivisible record in a
+single write. A failed append throws `LogFileError` with code
+`LOG_FILE_ERROR`; every old credential and deadline stays usable and the
+call is retryable. Across a restart or a compaction every new deadline,
+the cumulative renewal count and the original epochs all come back
+exactly — never half a batch and never double counted. An unterminated
+batch record at the tail of the log is treated as an interrupted append
+and ignored wholesale, while a complete but damaged batch record throws
+`LogFileError`. Older logs and snapshots stay readable, and credentials
+issued before the restart still cannot be renewed, individually or in a
+batch.
+
 ### Atomic groups
 
 `acquireAll(resources, holder, ttlMs, waitMs)` (also available as
@@ -208,8 +253,8 @@ of a live queue. Only the eventual grant is written to the log (in the same
 write as the release or reclaim that triggered it), so queued requests do
 not survive a restart.
 
-When `logPath` points at a file, every grant, renewal, early release,
-holder transfer and
+When `logPath` points at a file, every grant, renewal (including an atomic
+batch renewal, in one record), early release, holder transfer and
 reclaim is appended to it as one JSON line; each acquire (and transfer) line carries the
 credential epoch atomically with the grant. On startup the history is replayed
 in order, so unexpired leases keep occupying their resources, the four
