@@ -887,6 +887,90 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     }
   }
 
+  // Expire every due wait request as part of an atomic operation, capturing
+  // enough to put every queue position, index, ticket and deadline node back
+  // if the operation's log write fails. The groups are detached (so the wake
+  // planner can neither grant nor be blocked by them) before any grant is
+  // planned, exactly like a plain purge; nothing here is durable until the
+  // caller's single write lands.
+  function detachExpiredWaiters(now) {
+    const poppedNodes = [];
+    const groups = [];
+    while (deadlineQueue.size > 0) {
+      const node = deadlineQueue.peek();
+      if (node.dead) {
+        deadlineQueue.pop();
+        poppedNodes.push(node);
+        continue;
+      }
+      if (node.deadline > now) {
+        break;
+      }
+      deadlineQueue.pop();
+      poppedNodes.push(node);
+      const group = pendingGroups.get(node.requestId);
+      if (group === undefined || group.deadlineNode !== node) {
+        continue;
+      }
+      // Remember each position's exact queue and index before detaching so
+      // a rollback restores FIFO order byte-for-byte, even when several due
+      // groups shared a queue.
+      const positions = group.positions.map((position) => ({
+        position,
+        resource: position.resource,
+        index: waitQueues.get(position.resource).indexOf(position),
+      }));
+      detachGroup(group); // marks the popped node dead
+      groups.push({ group, positions });
+    }
+    return { poppedNodes, groups };
+  }
+
+  // The write failed: every due request comes back exactly where it stood,
+  // its ticket reads 'waiting' again and its deadline node is live, so the
+  // registry looks as if the triggering call never happened. Detachments are
+  // undone in reverse so each recorded index lands in the right place.
+  function reattachExpiredWaiters(record) {
+    for (let i = record.groups.length - 1; i >= 0; i -= 1) {
+      const { group, positions } = record.groups[i];
+      for (const entry of positions) {
+        let queue = waitQueues.get(entry.resource);
+        if (queue === undefined) {
+          queue = [];
+          waitQueues.set(entry.resource, queue);
+        }
+        queue.splice(Math.min(entry.index, queue.length), 0, entry.position);
+        const rs = resourceStates.get(entry.resource);
+        for (const quota of rs.chain) {
+          const refs = rs.waitRefs.get(quota) ?? 0;
+          if (refs === 0) {
+            quota.waitingResources.add(entry.resource);
+          }
+          rs.waitRefs.set(quota, refs + 1);
+        }
+      }
+      pendingGroups.set(group.requestId, group);
+      group.ticket.status = 'waiting';
+    }
+    // Re-push every popped node - expired, already-dead garbage included -
+    // restoring the heap's full contents; the matched node is live again.
+    for (const node of record.poppedNodes) {
+      const group = pendingGroups.get(node.requestId);
+      if (group !== undefined && group.deadlineNode === node) {
+        node.dead = false;
+      }
+      deadlineQueue.push(node);
+    }
+  }
+
+  // The write landed: the detached due requests stay out and their tickets
+  // record the timeout. The popped deadline nodes stay popped.
+  function commitExpiredWaiters(record) {
+    for (const { group } of record.groups) {
+      group.ticket.status = 'expired';
+    }
+  }
+
   function enqueueGroup(rows, ttlList, holder, now, waitMs, single) {
     requestSequence += 1;
     const requestId = `wait-${registryId}-${requestSequence}`;
@@ -1761,6 +1845,108 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     for (const plan of plans) {
       applyPlannedGrants(plan, now);
     }
+    return true;
+  }
+
+  // Atomically release a whole set of live credentials at one clock reading:
+  // every named share is removed and its contingent wake grants commit, or
+  // nothing at all happens. The tokens may come from different holders and
+  // batches, from exclusive and share resources, and may name several shares
+  // of one shared resource; carrying the newest epoch is never required. The
+  // releases themselves never advance an epoch; only the grants they wake do.
+  function releaseAll(tokens) {
+    // Shape first, before any credential lookup or clock read.
+    validateTokenList(tokens);
+
+    // Exactly one injected reading for the whole batch; a non-finite reading
+    // is a caller (clock) error, never a silent false.
+    const now = clock();
+    if (!Number.isFinite(now)) {
+      throw new TypeError('clock reading must be a finite number');
+    }
+
+    // Judge the whole batch before anything moves: every token must name a
+    // credential minted by this instance (unknown, other-instance,
+    // pre-restart, released, reclaimed and transfer-replaced tokens are all
+    // absent from the table or legacy) and still live at this reading
+    // (`expiresAt > now`, including when the reading went backwards).
+    const entries = [];
+    for (const token of tokens) {
+      const lease = leases.get(token);
+      if (lease === undefined || lease.legacy) {
+        return false;
+      }
+      entries.push({ token, lease, resource: lease.resource, chain: lease.chain });
+    }
+    for (const { lease } of entries) {
+      if (lease.expiresAt <= now) {
+        return false;
+      }
+    }
+
+    // Due wait requests give up as part of this same reading, before any
+    // wake is planned; they are detached tentatively so the planner cannot
+    // grant them and their exit frees no room, and they are fully restored
+    // if the write or any later check fails.
+    const expiredRecord = detachExpiredWaiters(now);
+
+    // All freed shares together fund capacity and every quota level; the
+    // planner serves heads per resource FIFO and picks fillable groups in
+    // strict arrival order, independent of the input token order.
+    const plans = planWakeups(
+      entries.map(({ token, resource, chain }) => ({ token, resource, chain })),
+      now,
+      false,
+    );
+
+    // Each woken credential's deadline is the shared reading plus that
+    // request position's own ttl; one non-finite result rejects the whole
+    // call and changes nothing observable.
+    for (const plan of plans) {
+      for (const grant of plan.grants) {
+        if (!Number.isFinite(grant.expiresAt)) {
+          reattachExpiredWaiters(expiredRecord);
+          throw new TypeError('granted expiry must be a finite number');
+        }
+      }
+    }
+
+    // One indivisible write: the release-all record and every wake grant
+    // either all land or none do.
+    const events = [{
+      v: LOG_VERSION,
+      type: 'release-all',
+      at: now,
+      items: entries.map(({ token, resource }) => ({ token, resource })),
+    }];
+    for (const plan of plans) {
+      for (const grant of plan.grants) {
+        events.push(grant.event);
+      }
+    }
+    try {
+      appendEvents(events);
+    } catch (error) {
+      // The write never happened: every due waiter returns to its exact
+      // queue position with its original ticket, and no lease, epoch or
+      // counter moved. The call is fully retryable.
+      reattachExpiredWaiters(expiredRecord);
+      throw error;
+    }
+
+    // The write landed: every named share comes off permanently; its expiry
+    // nodes retire lazily, exactly like a single release. Releases advance no
+    // epoch; renewed and reclaimed counters stay put.
+    for (const { token, lease } of entries) {
+      retirePermanent(lease);
+      leases.delete(token);
+      removeSlot(lease.resource, token);
+      counters.released += 1;
+    }
+    for (const plan of plans) {
+      applyPlannedGrants(plan, now);
+    }
+    commitExpiredWaiters(expiredRecord);
     return true;
   }
 
@@ -2875,6 +3061,7 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     renew,
     renewAll,
     release,
+    releaseAll,
     transfer,
     transferAll,
     sweep,
@@ -3519,6 +3706,66 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
         }
         // One batch counts as exactly one renewal per token, all or nothing.
         counters.renewed += targets.length;
+        break;
+      }
+      case 'release-all': {
+        // A group release is one indivisible record: every item is validated
+        // before any credential is removed, so a complete but damaged line
+        // is refused wholesale instead of recovering half a batch. The
+        // record's own sequence id makes a folded group (already inside a
+        // snapshot) skip exactly once, so it can never be applied or counted
+        // twice.
+        if (!Array.isArray(event.items) || event.items.length === 0) {
+          throw new LogFileError(
+            `corrupt release-all entry on line ${lineNumber} of ${logPath}`,
+          );
+        }
+        const targets = [];
+        const seen = new Set();
+        for (const item of event.items) {
+          if (
+            item === null ||
+            typeof item !== 'object' ||
+            typeof item.token !== 'string' ||
+            item.token === '' ||
+            item.resource === null ||
+            item.resource === undefined
+          ) {
+            throw new LogFileError(
+              `corrupt release-all entry on line ${lineNumber} of ${logPath}`,
+            );
+          }
+          if (seen.has(item.token)) {
+            throw new LogFileError(
+              `duplicate token in release-all entry on line ${lineNumber} of ${logPath}`,
+            );
+          }
+          seen.add(item.token);
+          const lease = leases.get(item.token);
+          // A committed batch only named credentials granted earlier in the
+          // same log (or present in the snapshot a folded batch rode in
+          // with); an unknown token means the history can no longer
+          // reconstruct the batch atomically.
+          if (lease === undefined) {
+            throw new LogFileError(
+              `release-all entry for unknown token on line ${lineNumber} of ${logPath}`,
+            );
+          }
+          if (lease.resource !== item.resource) {
+            throw new LogFileError(
+              `release-all resource mismatch on line ${lineNumber} of ${logPath}`,
+            );
+          }
+          targets.push({ token: item.token, lease });
+        }
+        // One batch removes every share and moves the released total by
+        // exactly the number of tokens, all or nothing.
+        for (const { token, lease } of targets) {
+          retirePermanent(lease);
+          leases.delete(token);
+          removeSlot(lease.resource, token);
+        }
+        counters.released += targets.length;
         break;
       }
       case 'release': {
