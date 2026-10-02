@@ -48,6 +48,13 @@ Node.js 20 or newer. No runtime dependencies.
   it returns true only when `token` is a current, live credential of
   `resource` carrying exactly the resource's last committed `epoch`; every
   other case throws `LeaseFencedError` (`code` `'LEASE_FENCED'`).
+- `Registry.writeCheckpoint(resource, token, epoch, expectedVersion,
+  checkpoint) -> { resource, height, hash, version, epoch }` atomically
+  fences the caller and commits one on-chain checkpoint; see "Checkpoints"
+  below.
+- `Registry.readCheckpoint(resource) ->
+  { resource, height, hash, version, epoch } | null` returns the last
+  committed checkpoint of a resource, or `null` when none exists.
 - `Registry.stats() -> { granted, renewed, released, reclaimed, live }`.
 - `Registry.exportState(now = clock()) -> object` returns a read-only JSON
   snapshot of the whole registry state; see "State export and consistency
@@ -69,6 +76,9 @@ Node.js 20 or newer. No runtime dependencies.
 - `LogFileError` exported class carrying a `code` property (`'LOG_FILE_ERROR'`).
 - `LeaseFencedError` exported class carrying a `code` property
   (`'LEASE_FENCED'`) and the `resource` it fences.
+- `CheckpointConflictError` exported class carrying a `code` property
+  (`'CHECKPOINT_CONFLICT'`), plus `resource`, `expectedVersion` and
+  `version` fields.
 
 ### Lease epochs and leader fencing
 
@@ -107,6 +117,57 @@ credentials across restart and compaction; recovery never advances an
 epoch a second time. On a share resource several live credentials coexist
 with distinct epochs, and only the one carrying the resource's last epoch
 passes the fence.
+
+### Checkpoints
+
+`Registry.writeCheckpoint(resource, token, epoch, expectedVersion,
+checkpoint)` couples the leader fence with an atomic compare-and-commit of
+an on-chain progress record, so a holder that was taken over can never
+overwrite a newer holder's progress. `checkpoint` is a plain object with a
+`height` (a non-negative safe integer) and a `hash` (a non-empty string);
+`resource` and `token` must be non-empty strings, `epoch` a positive safe
+integer and `expectedVersion` a non-negative safe integer — every argument
+is validated before the clock is read, and any violation throws
+`TypeError`, as does a non-finite clock reading.
+
+After validation the credential must pass the same fence `assertLease`
+enforces, plus the exclusivity rule a transfer uses: minted by this
+process and not removed, naming `resource`, carrying the resource's latest
+committed epoch, belonging to an undeclared exclusive resource, and live at
+the single clock reading (`expiresAt > now`). Any other situation —
+including a credential captured before a restart — throws
+`LeaseFencedError`.
+
+Once the fence passes, the write is an optimistic-concurrency commit on a
+per-resource version: the first write expects `expectedVersion` 0 and
+commits version 1, and every later write expects the version it last read
+and commits one higher. A mismatch throws `CheckpointConflictError`
+(`code` `'CHECKPOINT_CONFLICT'`); a version that would exceed the safe
+integer range throws `TypeError`. Heights may move backwards — a chain
+reorganization legitimately restarts progress from an earlier block — only
+the version is monotonic. A lease change (release, reclaim, expiry,
+transfer or retake) never resets the checkpoint or its version: the next
+leader simply continues the chain from the version it reads.
+
+On success the call returns
+`{ resource, height, hash, version, epoch }`, where `epoch` is the epoch
+of the writing credential. `Registry.readCheckpoint(resource)` returns the
+last committed record in the same shape, or `null` when the resource has
+no checkpoint; it validates `resource` but never reads the clock. Neither
+the input object nor the returned objects share state with the store —
+mutating them changes nothing.
+
+When `logPath` is set the checkpoint and its version commit in a single
+atomic log record: a failed append throws `LogFileError` and the previous
+value and version stay in force, so the same call is safely retryable.
+Restart and compaction recover the last committed value and version
+without applying anything twice; an unterminated log tail is ignored,
+while a complete but corrupt record or a corrupt snapshot throws
+`LogFileError`. Logs and snapshots written before checkpoints existed
+remain readable — a missing checkpoint section simply means empty — and
+with `logPath: null` checkpoints live in memory only. Checkpoint reads and
+writes never move leases, epochs, counters or wait queues, and the
+`exportState` and `checkConsistency` shapes are unchanged.
 
 ### Holder transfer
 

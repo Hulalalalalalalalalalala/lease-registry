@@ -85,6 +85,21 @@ export class LeaseFencedError extends Error {
 }
 LeaseFencedError.code = 'LEASE_FENCED';
 
+export class CheckpointConflictError extends Error {
+  constructor(resource, expectedVersion, currentVersion) {
+    super(
+      `checkpoint for resource ${String(resource)} expects version ${expectedVersion} `
+      + `but the committed version is ${currentVersion}`,
+    );
+    this.name = 'CheckpointConflictError';
+    this.code = CheckpointConflictError.code;
+    this.resource = resource;
+    this.expectedVersion = expectedVersion;
+    this.version = currentVersion;
+  }
+}
+CheckpointConflictError.code = 'CHECKPOINT_CONFLICT';
+
 // Binary min-heap ordered by (expiresAt, insertion order). Expiry heaps are
 // used three ways: one global heap drives reclamation, each resource gets one
 // for lazy capacity accounting, and each quota node gets one for lazy quota
@@ -256,6 +271,12 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
   // moves it backwards, so a resource with no live lease still reports the
   // epoch its last credential carried.
   const epochs = new Map();
+  // resource -> last committed on-chain checkpoint { height, hash, version,
+  // epoch }. Checkpoints live next to the lease table, not inside it: a
+  // release, reclaim, expiry or holder change never resets them, and the
+  // version only ever advances by one per committed write, surviving
+  // restarts and compactions exactly like the epochs do.
+  const checkpoints = new Map();
   // resource -> runtime bookkeeping. Created lazily; an undeclared resource
   // is a capacity-1 resource with no quota chain.
   const resourceStates = new Map();
@@ -2350,6 +2371,136 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     return true;
   }
 
+  // Atomically verify the caller's leadership and commit one on-chain
+  // checkpoint for the resource. The checkpoint is a plain { height, hash }
+  // progress record; each resource also carries a commit version that starts
+  // at 1 on the first write and advances by exactly one per committed write,
+  // so a stale holder that lost the lease (and with it the latest epoch) can
+  // never overwrite a newer holder's progress: it fails the fence first, and
+  // a caller replaying an already-committed write fails the version check.
+  // Heights may move backwards (a chain reorganization restarts progress
+  // from an earlier block); only the version is monotonic. Neither leases,
+  // epochs, counters nor wait queues are touched.
+  function writeCheckpoint(resource, token, epochValue, expectedVersion, checkpoint) {
+    // Every argument is validated before the clock is read or any credential
+    // is looked up, so a malformed call fails identically regardless of the
+    // current state.
+    if (typeof resource !== 'string' || resource === '') {
+      throw new TypeError('resource must be a non-empty string');
+    }
+    if (typeof token !== 'string' || token === '') {
+      throw new TypeError('token must be a non-empty string');
+    }
+    if (!Number.isSafeInteger(epochValue) || epochValue <= 0) {
+      throw new TypeError('epoch must be a positive safe integer');
+    }
+    if (!Number.isSafeInteger(expectedVersion) || expectedVersion < 0) {
+      throw new TypeError('expectedVersion must be a non-negative safe integer');
+    }
+    if (checkpoint === null || typeof checkpoint !== 'object' || Array.isArray(checkpoint)) {
+      throw new TypeError('checkpoint must be a plain object');
+    }
+    if (!Number.isSafeInteger(checkpoint.height) || checkpoint.height < 0) {
+      throw new TypeError('checkpoint height must be a non-negative safe integer');
+    }
+    if (typeof checkpoint.hash !== 'string' || checkpoint.hash === '') {
+      throw new TypeError('checkpoint hash must be a non-empty string');
+    }
+
+    // Exactly one injected reading for the whole operation; a non-finite
+    // reading is a caller (clock) error.
+    const now = clock();
+    if (!Number.isFinite(now)) {
+      throw new TypeError('clock reading must be a finite number');
+    }
+
+    // The same fence assertLease enforces, plus the exclusivity rule a
+    // transfer uses: the credential must be minted by this instance and
+    // still present (unknown, pre-restart, released, reclaimed and
+    // transfer-replaced tokens are all absent from the table or legacy),
+    // name this resource, carry the resource's latest committed epoch, sit
+    // on an undeclared exclusive resource, and be live at this reading.
+    const lease = leases.get(token);
+    if (lease === undefined || lease.legacy) {
+      throw new LeaseFencedError(lease === undefined ? null : lease.resource);
+    }
+    const rs = resourceStates.get(resource);
+    if (
+      lease.resource !== resource ||
+      rs === undefined ||
+      rs.declared ||
+      lease.epoch !== epochValue ||
+      epochs.get(resource) !== epochValue ||
+      lease.expiresAt <= now
+    ) {
+      throw new LeaseFencedError(resource);
+    }
+
+    // Optimistic concurrency on the commit version: the first write expects
+    // 0, every later write expects the version it last read. A mismatch
+    // means another write committed in between.
+    const current = checkpoints.get(resource);
+    const currentVersion = current === undefined ? 0 : current.version;
+    if (expectedVersion !== currentVersion) {
+      throw new CheckpointConflictError(resource, expectedVersion, currentVersion);
+    }
+    const nextVersion = currentVersion + 1;
+    if (!Number.isSafeInteger(nextVersion)) {
+      throw new TypeError('checkpoint version exceeds the safe integer range');
+    }
+
+    // One indivisible record carrying both the checkpoint and its version:
+    // the append either lands or throws LogFileError having changed nothing,
+    // so the previously committed value and version stay in force.
+    appendEvent({
+      v: LOG_VERSION,
+      type: 'checkpoint',
+      at: now,
+      resource,
+      height: checkpoint.height,
+      hash: checkpoint.hash,
+      version: nextVersion,
+      epoch: epochValue,
+    });
+
+    // The write landed: commit a private copy so later mutations of the
+    // caller's object cannot reach the stored record.
+    checkpoints.set(resource, {
+      height: checkpoint.height,
+      hash: checkpoint.hash,
+      version: nextVersion,
+      epoch: epochValue,
+    });
+    return {
+      resource,
+      height: checkpoint.height,
+      hash: checkpoint.hash,
+      version: nextVersion,
+      epoch: epochValue,
+    };
+  }
+
+  // Last committed checkpoint of a resource, or null when none was ever
+  // committed. Purely a read: the clock is never consulted and nothing is
+  // reconciled, reclaimed or woken. The returned object is a fresh copy, so
+  // mutating it cannot reach the stored record.
+  function readCheckpoint(resource) {
+    if (typeof resource !== 'string' || resource === '') {
+      throw new TypeError('resource must be a non-empty string');
+    }
+    const current = checkpoints.get(resource);
+    if (current === undefined) {
+      return null;
+    }
+    return {
+      resource,
+      height: current.height,
+      hash: current.hash,
+      version: current.version,
+      epoch: current.epoch,
+    };
+  }
+
   function stats() {
     const now = clock();
     purgeExpiredWaiters(now);
@@ -2998,6 +3149,20 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
       epochEntries.push({ resource, epoch: value });
     }
 
+    // The last committed checkpoint of every resource, including resources
+    // whose lease has long expired: a lease change never resets a checkpoint,
+    // so the image carries value and version forward exactly like the epochs.
+    const checkpointEntries = [];
+    for (const [resource, entry] of checkpoints.entries()) {
+      checkpointEntries.push({
+        resource,
+        height: entry.height,
+        hash: entry.hash,
+        version: entry.version,
+        epoch: entry.epoch,
+      });
+    }
+
     const snapshot = {
       v: SNAPSHOT_VERSION,
       type: 'snapshot',
@@ -3010,6 +3175,7 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
       resources: resourceEntries,
       epochs: epochEntries,
       leases: leaseEntries,
+      checkpoints: checkpointEntries,
     };
 
     // 1. Publish the snapshot. If this fails, nothing else has moved and the
@@ -3068,6 +3234,8 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     holder,
     epoch,
     assertLease,
+    writeCheckpoint,
+    readCheckpoint,
     stats,
     cancel,
     compact,
@@ -3271,7 +3439,8 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
         (!Number.isInteger(value.batchSeq) || value.batchSeq < 0)) ||
       (value.quotas !== undefined && !Array.isArray(value.quotas)) ||
       (value.resources !== undefined && !Array.isArray(value.resources)) ||
-      (value.epochs !== undefined && !Array.isArray(value.epochs))
+      (value.epochs !== undefined && !Array.isArray(value.epochs)) ||
+      (value.checkpoints !== undefined && !Array.isArray(value.checkpoints))
     ) {
       throw new LogFileError(`corrupt lease snapshot at ${snapshotPath}`);
     }
@@ -3341,6 +3510,31 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
         epochIds.add(entry.resource);
       }
     }
+    if (value.checkpoints !== undefined) {
+      const checkpointIds = new Set();
+      for (const entry of value.checkpoints) {
+        if (
+          entry === null ||
+          typeof entry !== 'object' ||
+          typeof entry.resource !== 'string' ||
+          entry.resource === '' ||
+          !Number.isSafeInteger(entry.height) ||
+          entry.height < 0 ||
+          typeof entry.hash !== 'string' ||
+          entry.hash === '' ||
+          !Number.isSafeInteger(entry.version) ||
+          entry.version <= 0 ||
+          !Number.isSafeInteger(entry.epoch) ||
+          entry.epoch <= 0
+        ) {
+          throw new LogFileError(`corrupt lease snapshot checkpoint at ${snapshotPath}`);
+        }
+        if (checkpointIds.has(entry.resource)) {
+          throw new LogFileError(`duplicate checkpoint in snapshot at ${snapshotPath}`);
+        }
+        checkpointIds.add(entry.resource);
+      }
+    }
     for (const entry of value.leases) {
       if (
         entry === null ||
@@ -3385,6 +3579,18 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
       for (const entry of snapshot.epochs) {
         epochs.set(entry.resource, entry.epoch);
       }
+    }
+
+    // Committed checkpoints come back exactly as folded; an image written by
+    // an older build simply has no section and every resource starts empty.
+    // Only tail checkpoint events replayed afterwards move a version on.
+    for (const entry of snapshot.checkpoints ?? []) {
+      checkpoints.set(entry.resource, {
+        height: entry.height,
+        hash: entry.hash,
+        version: entry.version,
+        epoch: entry.epoch,
+      });
     }
 
     // Each live credential carries the epoch it was granted in; those epochs
@@ -3989,6 +4195,41 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
           }
           counters.reclaimed += 1;
         }
+        break;
+      }
+      case 'checkpoint': {
+        if (
+          typeof event.resource !== 'string' ||
+          event.resource === '' ||
+          !Number.isSafeInteger(event.height) ||
+          event.height < 0 ||
+          typeof event.hash !== 'string' ||
+          event.hash === '' ||
+          !Number.isSafeInteger(event.version) ||
+          event.version <= 0 ||
+          !Number.isSafeInteger(event.epoch) ||
+          event.epoch <= 0
+        ) {
+          throw new LogFileError(
+            `corrupt checkpoint entry on line ${lineNumber} of ${logPath}`,
+          );
+        }
+        // Replay applies every committed write exactly once, so the logged
+        // version must be exactly one past the resource's recovered version:
+        // a gap, a repeat or a smaller value means the log can no longer
+        // reconstruct a consistent commit order and is corrupt.
+        const expectedVersion = (checkpoints.get(event.resource)?.version ?? 0) + 1;
+        if (event.version !== expectedVersion) {
+          throw new LogFileError(
+            `non-monotonic checkpoint version on line ${lineNumber} of ${logPath}`,
+          );
+        }
+        checkpoints.set(event.resource, {
+          height: event.height,
+          hash: event.hash,
+          version: event.version,
+          epoch: event.epoch,
+        });
         break;
       }
       default: {
