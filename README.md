@@ -48,6 +48,15 @@ Node.js 20 or newer. No runtime dependencies.
   it returns true only when `token` is a current, live credential of
   `resource` carrying exactly the resource's last committed `epoch`; every
   other case throws `LeaseFencedError` (`code` `'LEASE_FENCED'`).
+- `Registry.writeCheckpoint(resource, token, epoch, expectedVersion,
+  checkpoint) -> { resource, height, hash, version, epoch }` compare-and-
+  commits one chain checkpoint behind the leader fence; see "Chain
+  checkpoints and cross-resource atomic commits" below.
+- `Registry.writeCheckpointAll(entries) -> [{ resource, height, hash,
+  version, epoch }, ...]` atomically commits checkpoints across several
+  resources in one call; see below.
+- `Registry.readCheckpoint(resource) -> { resource, height, hash, version,
+  epoch } | null` reports the last committed checkpoint of a resource.
 - `Registry.stats() -> { granted, renewed, released, reclaimed, live }`.
 - `Registry.exportState(now = clock()) -> object` returns a read-only JSON
   snapshot of the whole registry state; see "State export and consistency
@@ -69,6 +78,9 @@ Node.js 20 or newer. No runtime dependencies.
 - `LogFileError` exported class carrying a `code` property (`'LOG_FILE_ERROR'`).
 - `LeaseFencedError` exported class carrying a `code` property
   (`'LEASE_FENCED'`) and the `resource` it fences.
+- `CheckpointConflictError` exported class carrying a `code` property
+  (`'CHECKPOINT_CONFLICT'`) plus the `resource`, the `expected` version and
+  the `actual` version.
 
 ### Lease epochs and leader fencing
 
@@ -488,6 +500,73 @@ empty; otherwise `ok` is `false` and each issue pinpoints its finding as
 
 
 
+## Chain checkpoints and cross-resource atomic commits
+
+On top of the leader fence sit chain checkpoints. The current leader of an
+exclusive resource can compare-and-commit a `{ height, hash }` checkpoint by
+naming the version it last observed:
+
+    Registry.writeCheckpoint(resource, token, epoch, expectedVersion, checkpoint)
+      -> { resource, height, hash, version, epoch }
+
+The version starts at 1 on the first successful write (the first write must
+expect version 0) and advances by exactly one per committed write. It
+survives lease turnover, releases, reclaims, restarts and compactions — a
+holder handover never resets the progress — so a stale holder that lost the
+lease can never overwrite a successor's record. A chain reorganization may
+lower the height freely, and writing byte-identical content again still
+moves the version by one. Checkpoints move no lease, epoch, counter or
+wait-queue state.
+
+`Registry.writeCheckpointAll(entries)` commits checkpoints across several
+resources atomically: every named resource advances one version in one
+indivisible commit or none of them does. Each entry is exactly
+`{ resource, token, epoch, expectedVersion, checkpoint }` with
+`checkpoint = { height, hash }`; the resources may come from different
+holders and different acquisition batches. On success it returns one record
+per entry, in input order, with the same shape as a single write, and all
+results become visible to `readCheckpoint` at once.
+
+`entries` must be a non-empty array with no empty slots, each entry a
+non-empty, non-array object holding exactly its five fields, and each
+checkpoint a non-empty, non-array object holding exactly `height` and
+`hash`. Resource, token and hash must be non-empty strings, `epoch` a
+positive safe integer, and `expectedVersion` and `height` non-negative safe
+integers. A repeated resource, a repeated token, a missing or extra field,
+or any type or value mismatch throws `TypeError`; the whole batch shape is
+validated before the clock is read or any credential is consulted, so the
+same malformed call throws regardless of current state.
+
+After validation the injected clock is read exactly once; a non-finite
+reading throws `TypeError`. Every credential is then checked in input order
+with the same fence `writeCheckpoint` uses — an unknown token, a credential
+from another instance or from before a restart, one already released,
+reclaimed or removed, a resource mismatch, a non-latest epoch, a declared
+(share) resource (even one of capacity one), or one with
+`expiresAt <= now` makes the whole call throw `LeaseFencedError` naming the
+first failing resource. Only when every credential survives are the
+expected versions checked, again in input order: the first mismatch throws
+`CheckpointConflictError` (`'CHECKPOINT_CONFLICT'`) carrying the resource,
+the expected and the actual version. After every version matches, a next
+version outside the safe integer range rejects the batch as `TypeError`.
+
+A failed call leaves every checkpoint and the valid log history exactly as
+before; success or failure changes no lease, epoch, counter, wait queue or
+ticket. Mutating an input entry, a checkpoint object or a returned record
+can never reach the stored state.
+
+When `logPath` is set the whole batch appends as one indivisible
+`checkpoint-all` record carrying the shared reading and one
+`{ resource, height, hash, version, epoch }` item per entry. If the append
+fails the call throws `LogFileError` (`'LOG_FILE_ERROR'`) and the batch is
+retryable verbatim. Across a restart or compaction every resource's
+progress is restored exactly once — a batch can never come back half
+applied or advance a version twice. An unfinished batch record at the log
+tail (no terminating newline) is ignored in its entirety; a complete but
+structurally damaged record or a version sequence that is not continuous
+throws `LogFileError` at startup. Logs and snapshots written by older
+versions stay readable; with no `logPath` batch results live in memory
+only.
 ## Shareable resources and hierarchical quotas
 
 By default every resource is exclusive and single-occupancy, exactly as
