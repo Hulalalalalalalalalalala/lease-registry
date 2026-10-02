@@ -1620,6 +1620,112 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     return true;
   }
 
+  // Validate one batch-renew argument: a non-empty array whose elements are
+  // pairwise distinct, non-empty strings. Shape errors are TypeErrors and are
+  // raised before the clock is read or any token is looked up, so a malformed
+  // call never depends on which credentials currently exist.
+  function validateRenewTokens(tokens) {
+    if (!Array.isArray(tokens) || tokens.length === 0) {
+      throw new TypeError('tokens must be a non-empty array');
+    }
+    const seen = new Set();
+    for (const token of tokens) {
+      if (typeof token !== 'string' || token === '') {
+        throw new TypeError('each token must be a non-empty string');
+      }
+      if (seen.has(token)) {
+        throw new TypeError('tokens must be unique');
+      }
+      seen.add(token);
+    }
+  }
+
+  // Atomically renew a whole heartbeat of leases at one clock reading: every
+  // named credential is extended or none of them is. The tokens may come
+  // from different batches and holders, including different shares of one
+  // shared resource; no current epoch is required.
+  function renewAll(tokens) {
+    validateRenewTokens(tokens);
+
+    // Exactly one injected reading for the whole batch; a non-finite reading
+    // is a caller (clock) error, never a silent false.
+    const now = clock();
+    if (!Number.isFinite(now)) {
+      throw new TypeError('clock reading must be a finite number');
+    }
+
+    // Judge the whole batch before anything moves: every token must name a
+    // credential minted by this instance (unknown, other-instance,
+    // pre-restart, released, reclaimed and transfer-replaced tokens are all
+    // absent from the table or legacy) and still live at this reading
+    // (`expiresAt > now`, including when the reading went backwards).
+    const leasesToRenew = [];
+    for (const token of tokens) {
+      const lease = leases.get(token);
+      if (lease === undefined || lease.legacy) {
+        return false;
+      }
+      leasesToRenew.push({ token, lease });
+    }
+    for (const { lease } of leasesToRenew) {
+      if (lease.expiresAt <= now) {
+        return false;
+      }
+    }
+
+    // Every new deadline is computed from the same reading before any owner
+    // observation runs or anything is written; one non-finite result rejects
+    // the whole call as a TypeError.
+    const renewals = [];
+    for (const { token, lease } of leasesToRenew) {
+      const expiresAt = now + lease.ttlMs;
+      if (!Number.isFinite(expiresAt)) {
+        throw new TypeError('renewed expiry must be a finite number');
+      }
+      renewals.push({ token, lease, expiresAt });
+    }
+
+    // Bring every owner of every share to the passed reading first, exactly
+    // like a single renew: a clock that moved backwards may have revived a
+    // share an earlier reading retired, and the fresh expiry node has to land
+    // on the same owner state the liveness judgment used. Owners repeat
+    // across shares of one resource, so each is reconciled once.
+    const owners = new Set();
+    for (const { lease } of leasesToRenew) {
+      owners.add(resourceStates.get(lease.resource));
+      for (const quota of lease.chain) {
+        owners.add(quota);
+      }
+    }
+    for (const owner of owners) {
+      if (owner !== undefined) {
+        reconcile(owner, now);
+      }
+    }
+
+    // One indivisible record for the whole heartbeat: the append either
+    // lands with every renewal in it or throws LogFileError having changed
+    // nothing durable, and the old credentials and expiries stay retryable.
+    appendEvent({
+      v: LOG_VERSION,
+      type: 'renew-all',
+      at: now,
+      items: renewals.map(({ token, expiresAt }) => ({ token, expiresAt })),
+    });
+
+    // The write landed: each lease gets its own ttl-based expiry from the
+    // shared reading; token, holder, ttlMs and epoch are untouched. The wait
+    // queues are deliberately never purged, woken or adjusted, and only the
+    // cumulative renewal counter moves - by exactly the number of tokens.
+    for (const { token, lease, expiresAt } of renewals) {
+      lease.expiresAt = expiresAt;
+      lease.heapSeq += 1;
+      pushLeaseHeaps(token, lease);
+    }
+    counters.renewed += renewals.length;
+    return true;
+  }
+
   function release(token) {
     const lease = leases.get(token);
     if (lease === undefined || lease.legacy) {
@@ -2608,6 +2714,7 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     declareResource,
     setQuota,
     renew,
+    renewAll,
     release,
     transfer,
     sweep,
@@ -3199,6 +3306,59 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
           pushLeaseHeaps(event.token, lease);
         }
         counters.renewed += 1;
+        break;
+      }
+      case 'renew-all': {
+        // A batch heartbeat is one indivisible record: every item is
+        // validated before any of them is applied, so a complete but
+        // damaged batch line is refused wholesale instead of recovering
+        // half a batch. The record's own sequence id makes a folded batch
+        // (snapshot already contains its expiries and counts) skip exactly
+        // once, so it can never be double counted.
+        if (!Array.isArray(event.items) || event.items.length === 0) {
+          throw new LogFileError(
+            `corrupt renew-all entry on line ${lineNumber} of ${logPath}`,
+          );
+        }
+        const targets = [];
+        const seen = new Set();
+        for (const item of event.items) {
+          if (
+            item === null ||
+            typeof item !== 'object' ||
+            typeof item.token !== 'string' ||
+            item.token === '' ||
+            !Number.isFinite(item.expiresAt)
+          ) {
+            throw new LogFileError(
+              `corrupt renew-all entry on line ${lineNumber} of ${logPath}`,
+            );
+          }
+          if (seen.has(item.token)) {
+            throw new LogFileError(
+              `duplicate token in renew-all entry on line ${lineNumber} of ${logPath}`,
+            );
+          }
+          seen.add(item.token);
+          const lease = leases.get(item.token);
+          // A committed batch only ever named credentials granted earlier
+          // in the same log (or present in the snapshot a folded batch rode
+          // in with); an unknown token therefore means the history can no
+          // longer reconstruct the batch atomically.
+          if (lease === undefined) {
+            throw new LogFileError(
+              `renew-all entry for unknown token on line ${lineNumber} of ${logPath}`,
+            );
+          }
+          targets.push({ token: item.token, lease, expiresAt: item.expiresAt });
+        }
+        for (const { token, lease, expiresAt } of targets) {
+          lease.expiresAt = expiresAt;
+          lease.heapSeq += 1;
+          pushLeaseHeaps(token, lease);
+        }
+        // One batch counts as exactly one renewal per token, all or nothing.
+        counters.renewed += targets.length;
         break;
       }
       case 'release': {
