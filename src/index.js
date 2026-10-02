@@ -1764,6 +1764,101 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     return true;
   }
 
+  // Atomically release a whole set of shares: either every named credential
+  // ends now, or none of them does. The tokens may come from different
+  // holders, different batches, exclusive resources and several shares of one
+  // shared resource; no current epoch is required. The release itself moves
+  // no epoch - only credentials handed to requests woken by the freed shares
+  // advance epochs and the granted counter, by the existing grant rules.
+  function releaseAll(tokens) {
+    // Shape first, before any credential lookup or clock read: a malformed
+    // call fails identically regardless of which credentials currently
+    // exist.
+    validateTokenList(tokens);
+
+    // Exactly one injected reading for the whole batch; a non-finite reading
+    // is a caller (clock) error, never a silent false.
+    const now = clock();
+    if (!Number.isFinite(now)) {
+      throw new TypeError('clock reading must be a finite number');
+    }
+
+    // Judge the whole batch before anything moves. Every token must name a
+    // credential minted by this instance (unknown, other-instance,
+    // pre-restart, released, reclaimed and transfer-replaced tokens are all
+    // absent from the table or legacy) and still live at this reading
+    // (`expiresAt > now`, including when the reading went backwards). The
+    // tokens are pairwise distinct, so each target is removed exactly once
+    // and the result cannot depend on the input order.
+    const targets = [];
+    for (const token of tokens) {
+      const lease = leases.get(token);
+      if (lease === undefined || lease.legacy || lease.expiresAt <= now) {
+        return false;
+      }
+      targets.push({ token, lease });
+    }
+
+    purgeExpiredWaiters(now);
+
+    // All released shares fund the cascade together - resource capacity and
+    // every quota-level allowance at once - so single and group requests are
+    // woken strictly by arrival order under the usual per-resource FIFO,
+    // independently of the order the releases were named in.
+    const freedEntries = targets.map(({ token, lease }) => ({
+      token,
+      resource: lease.resource,
+      chain: lease.chain,
+    }));
+    const plans = planWakeups(freedEntries, now, false);
+
+    // Every woken credential's deadline is this reading plus its own ttl
+    // (captured when the request queued). A non-finite result rejects the
+    // whole call as a TypeError before anything is written.
+    for (const plan of plans) {
+      for (const grant of plan.grants) {
+        if (!Number.isFinite(grant.expiresAt)) {
+          throw new TypeError('granted expiry must be a finite number');
+        }
+      }
+    }
+
+    // One indivisible record for the release plus every cascade grant: the
+    // append either lands with the whole result in it or throws
+    // LogFileError having changed nothing durable, leases, epochs, counters,
+    // queue positions and the queued ticket objects included, and the batch
+    // stays fully retryable. Planning only read state; reconcile mutations
+    // are lazy observation rather than committed movement.
+    const events = [{
+      v: LOG_VERSION,
+      type: 'release-all',
+      at: now,
+      items: targets.map(({ token, lease }) => ({ token, resource: lease.resource })),
+    }];
+    for (const plan of plans) {
+      for (const grant of plan.grants) {
+        events.push(grant.event);
+      }
+    }
+    appendEvents(events);
+
+    // The write landed: every target comes off permanently; its expiry nodes
+    // retire lazily. The release moves no epoch and adds one to the released
+    // counter per credential; renewed and reclaimed stay put. Other
+    // credentials are untouched. The cascade grants then commit under the
+    // ordinary rules, advancing epochs and granted.
+    for (const { token, lease } of targets) {
+      retirePermanent(lease);
+      leases.delete(token);
+      removeSlot(lease.resource, token);
+    }
+    counters.released += targets.length;
+    for (const plan of plans) {
+      applyPlannedGrants(plan, now);
+    }
+    return true;
+  }
+
   // Hand one live exclusive credential from its current holder to a new
   // holder without a free gap. The old credential dies as a fresh one is
   // born: a single transfer event commits both credentials and the epoch in
@@ -2875,6 +2970,7 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     renew,
     renewAll,
     release,
+    releaseAll,
     transfer,
     transferAll,
     sweep,
@@ -3534,6 +3630,66 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
           removeSlot(lease.resource, event.token);
         }
         counters.released += 1;
+        break;
+      }
+      case 'release-all': {
+        // An atomic release is one indivisible record: every item is
+        // validated before any lease is removed, so a complete but damaged
+        // line is refused wholesale instead of recovering half a batch.
+        // The record's own sequence id makes a folded release (already
+        // reflected by the snapshot) skip exactly once, so it can never be
+        // double counted. Queued requests are not replayed, so the grants
+        // the release cascaded into ride along as their own acquire events.
+        if (!Array.isArray(event.items) || event.items.length === 0) {
+          throw new LogFileError(
+            `corrupt release-all entry on line ${lineNumber} of ${logPath}`,
+          );
+        }
+        const targets = [];
+        const seen = new Set();
+        for (const item of event.items) {
+          if (
+            item === null ||
+            typeof item !== 'object' ||
+            typeof item.token !== 'string' ||
+            item.token === '' ||
+            item.resource === null || item.resource === undefined
+          ) {
+            throw new LogFileError(
+              `corrupt release-all entry on line ${lineNumber} of ${logPath}`,
+            );
+          }
+          if (seen.has(item.token)) {
+            throw new LogFileError(
+              `duplicate token in release-all entry on line ${lineNumber} of ${logPath}`,
+            );
+          }
+          seen.add(item.token);
+          // A committed batch only ever named credentials granted earlier
+          // in the same log (or present in the snapshot a folded batch rode
+          // in with); an unknown or already-removed token means the history
+          // can no longer reconstruct the batch atomically.
+          const lease = leases.get(item.token);
+          if (lease === undefined) {
+            throw new LogFileError(
+              `release-all entry for unknown token on line ${lineNumber} of ${logPath}`,
+            );
+          }
+          if (lease.resource !== item.resource) {
+            throw new LogFileError(
+              `release-all entry with mismatched resource on line ${lineNumber} of ${logPath}`,
+            );
+          }
+          targets.push({ token: item.token, lease });
+        }
+        for (const { token, lease } of targets) {
+          retirePermanent(lease);
+          leases.delete(token);
+          removeSlot(lease.resource, token);
+        }
+        // One batch counts as exactly one release per credential, all or
+        // nothing.
+        counters.released += targets.length;
         break;
       }
       case 'transfer': {

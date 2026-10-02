@@ -30,6 +30,8 @@ Node.js 20 or newer. No runtime dependencies.
 - `Registry.renewAll(tokens) -> boolean` renews a whole heartbeat of leases
   atomically at one clock reading; see "Batch renewal" below.
 - `Registry.release(token) -> boolean` ends a lease early.
+- `Registry.releaseAll(tokens) -> boolean` ends a whole set of leases
+  atomically at one clock reading; see "Batch release" below.
 - `Registry.transfer(token, holder, ttlMs = undefined) ->
   { resource, holder, token, expiresAt, epoch }` hands a live exclusive
   credential straight to a new holder without a free gap; see "Holder
@@ -257,6 +259,58 @@ entirety, while a complete but structurally damaged batch record throws
 `LogFileError`. Logs and snapshots written by older versions stay readable,
 and credentials issued before a restart still cannot be batch renewed.
 
+### Batch release
+
+`Registry.releaseAll(tokens) -> boolean` ends a whole set of leases together:
+either every named credential is released, or none of them is. `tokens` must
+be a non-empty array of pairwise distinct, non-empty strings with no empty
+slots. A non-array, an empty array, an empty slot, a non-string element, an
+empty string or a repeated token all throw `TypeError`; the shape is
+validated before any token is looked up or the clock is read, so the same
+malformed call throws regardless of which credentials currently exist. The
+tokens may come from different holders and different batches, may mix
+exclusive resources and several shares of one shared resource, and carrying
+the newest epoch is never required.
+
+After the argument passes validation the injected clock is read exactly
+once; a non-finite reading throws `TypeError`. Every token must then name a
+credential minted by this instance and still live at that reading
+(`expiresAt > now`, the same rule `release` uses, so a reading that moved
+backwards simply judges the batch against the earlier instant). An unknown
+token, a token owned by another instance, one issued before a restart, or
+one that was already released, reclaimed, replaced by a holder transfer or
+has expired makes the whole call return `false`; removed credentials never
+revive, and on failure nothing changes — no lease, epoch, counter, wait
+ticket or log line.
+
+On success the call returns `true`: every target share is removed, the
+cumulative `released` counter increases by exactly the number of tokens,
+`renewed` and `reclaimed` do not move, credentials not named in the call are
+untouched, and the release itself advances no epoch. All freed shares
+together fund the wait queues — resource capacity and every quota-level
+allowance at once — so single and group requests are woken by the existing
+per-resource FIFO and grantable-request arrival order, independently of the
+input order; a group whose demand is not fully covered stays `waiting`, and
+a queued request whose deadline the reading passed becomes `expired` and
+leaves every queue. Granted tickets keep their existing shape and original
+application order, and each granted credential's expiry is the reading plus
+that request's own TTL; a non-finite resulting expiry makes the whole call
+throw `TypeError` with no state change.
+
+When `logPath` is set the release and the grants it cascades into are
+appended as one indivisible `release-all` record followed by the grant
+events in the same write; if the append fails the call throws
+`LogFileError` (`code` `'LOG_FILE_ERROR'`) and rolls fully back — leases,
+epochs, counters, queue positions and the original ticket objects return to
+before the call, so it is retryable. Across a restart or compaction every
+removal and the cumulative release count are restored exactly once — a
+batch can never come back half applied or be counted twice. An unfinished
+record at the log tail is ignored in its entirety, while a complete but
+structurally damaged record throws `LogFileError` on startup. Logs and
+snapshots written by older versions stay readable, waiting requests are not
+recovered, and credentials issued before a restart still cannot be batch
+released.
+
 ### Atomic groups
 
 `acquireAll(resources, holder, ttlMs, waitMs)` (also available as
@@ -324,10 +378,10 @@ write as the release or reclaim that triggered it), so queued requests do
 not survive a restart.
 
 When `logPath` points at a file, every grant, renewal (single or atomic
-batch), early release, holder transfer (single or atomic group) and
-reclaim is appended to it as one JSON line; each acquire, transfer and
-transfer-all line carries the credential epoch(s) atomically with the
-grant. On startup the history is replayed
+batch), early release (single or atomic batch), holder transfer (single or
+atomic group) and reclaim is appended to it as one JSON line; each acquire,
+transfer and transfer-all line carries the credential epoch(s) atomically
+with the grant. On startup the history is replayed
 in order, so unexpired leases keep occupying their resources, the four
 cumulative counters come back exactly as they were, and every resource's
 last committed epoch comes back exactly as it stood; replay itself adds no
