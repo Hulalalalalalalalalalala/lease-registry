@@ -28,7 +28,9 @@
 // turnover, restarts and compactions, so a stale holder that lost the lease
 // can never overwrite the progress a successor recorded; a chain
 // reorganization may lower the height freely. Checkpoints move no lease,
-// epoch, counter or wait-queue state.
+// epoch, counter or wait-queue state. A batch of such writes across several
+// resources commits atomically through one log record: every named
+// checkpoint advances together, or none of them does.
 //
 // Persistence layout:
 //   <logPath>           append-only event log, one JSON object per line
@@ -2484,6 +2486,160 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     return { resource, height, hash, version: nextVersion, epoch: epochValue };
   }
 
+  // Validate one checkpoint batch: a non-empty array with no empty slots,
+  // each entry a plain object holding exactly `resource`, `token`, `epoch`,
+  // `expectedVersion` and `checkpoint`, with pairwise distinct resources and
+  // tokens. Anything else is a caller TypeError, raised before the clock is
+  // read or any credential is consulted, so a malformed call fails
+  // identically regardless of which credentials currently exist.
+  function validateCheckpointEntries(entries) {
+    if (!Array.isArray(entries) || entries.length === 0) {
+      throw new TypeError('entries must be a non-empty array');
+    }
+    const seenResources = new Set();
+    const seenTokens = new Set();
+    for (const entry of entries) {
+      if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+        throw new TypeError('each entry must be a plain object');
+      }
+      const keys = Object.keys(entry);
+      if (
+        keys.length !== 5 ||
+        !keys.includes('resource') ||
+        !keys.includes('token') ||
+        !keys.includes('epoch') ||
+        !keys.includes('expectedVersion') ||
+        !keys.includes('checkpoint')
+      ) {
+        throw new TypeError(
+          'each entry must contain exactly resource, token, epoch, expectedVersion and checkpoint',
+        );
+      }
+      if (typeof entry.resource !== 'string' || entry.resource === '') {
+        throw new TypeError('resource must be a non-empty string');
+      }
+      if (typeof entry.token !== 'string' || entry.token === '') {
+        throw new TypeError('token must be a non-empty string');
+      }
+      if (!Number.isSafeInteger(entry.epoch) || entry.epoch <= 0) {
+        throw new TypeError('epoch must be a positive safe integer');
+      }
+      if (!Number.isSafeInteger(entry.expectedVersion) || entry.expectedVersion < 0) {
+        throw new TypeError('expectedVersion must be a non-negative safe integer');
+      }
+      validateCheckpoint(entry.checkpoint);
+      if (seenResources.has(entry.resource)) {
+        throw new TypeError('resources must be unique');
+      }
+      if (seenTokens.has(entry.token)) {
+        throw new TypeError('tokens must be unique');
+      }
+      seenResources.add(entry.resource);
+      seenTokens.add(entry.token);
+    }
+  }
+
+  // Atomic multi-resource checkpoint commit behind the leader fence: every
+  // named write lands together or none does. The entries may name resources
+  // held by different holders or acquired in different batches. The whole
+  // batch is judged before anything moves - every credential fenced in
+  // input order, then every expected version in input order - and one
+  // indivisible log record commits all of them at once, so a failed append
+  // leaves every checkpoint and version untouched and the call is fully
+  // retryable. Like a single write it moves no lease, epoch, counter or
+  // wait-queue state, and a lease handover never resets the progress.
+  function writeCheckpointAll(entries) {
+    // Shape first, before any clock read or credential lookup.
+    validateCheckpointEntries(entries);
+
+    // Exactly one injected reading for the whole batch; a non-finite reading
+    // is a caller (clock) error, never a silent fence.
+    const now = clock();
+    if (!Number.isFinite(now)) {
+      throw new TypeError('clock reading must be a finite number');
+    }
+
+    // The same fence writeCheckpoint enforces, checked for every entry in
+    // input order before any version is consulted: the credential must be
+    // minted by this instance, never removed, name this resource, carry the
+    // resource's latest epoch, sit on an undeclared exclusive resource, and
+    // be live at this reading. The first failure names its resource.
+    for (const entry of entries) {
+      const lease = leases.get(entry.token);
+      const rs = resourceStates.get(entry.resource);
+      if (
+        lease === undefined ||
+        lease.legacy ||
+        lease.resource !== entry.resource ||
+        rs === undefined ||
+        rs.declared ||
+        lease.epoch !== entry.epoch ||
+        epochs.get(entry.resource) !== entry.epoch ||
+        lease.expiresAt <= now
+      ) {
+        throw new LeaseFencedError(entry.resource);
+      }
+    }
+
+    // Optimistic concurrency across the whole batch, again in input order:
+    // every entry must name the version currently committed for its
+    // resource. Resources are pairwise distinct, so no entry can observe
+    // another entry's planned advance.
+    for (const entry of entries) {
+      const existing = checkpoints.get(entry.resource);
+      const currentVersion = existing === undefined ? 0 : existing.version;
+      if (entry.expectedVersion !== currentVersion) {
+        throw new CheckpointConflictError(
+          entry.resource, entry.expectedVersion, currentVersion,
+        );
+      }
+    }
+
+    // Every version matched; each resource's next version must still be a
+    // safe integer before anything is written.
+    for (const entry of entries) {
+      if (!Number.isSafeInteger(entry.expectedVersion + 1)) {
+        throw new TypeError('checkpoint version exceeds the safe integer range');
+      }
+    }
+
+    // One indivisible record for the whole batch: the append either lands
+    // with every write in it or throws LogFileError having changed nothing
+    // durable, and every old checkpoint stays retryable.
+    appendEvent({
+      v: LOG_VERSION,
+      type: 'checkpoint-all',
+      at: now,
+      items: entries.map((entry) => ({
+        resource: entry.resource,
+        height: entry.checkpoint.height,
+        hash: entry.checkpoint.hash,
+        version: entry.expectedVersion + 1,
+        epoch: entry.epoch,
+      })),
+    });
+
+    // The write landed: commit every record in input order. Only primitives
+    // are stored and every returned record is a fresh object, so later
+    // mutation of the caller's entries or of the results cannot reach in.
+    const result = [];
+    for (const entry of entries) {
+      const { height, hash } = entry.checkpoint;
+      const version = entry.expectedVersion + 1;
+      checkpoints.set(entry.resource, {
+        height, hash, version, epoch: entry.epoch,
+      });
+      result.push({
+        resource: entry.resource,
+        height,
+        hash,
+        version,
+        epoch: entry.epoch,
+      });
+    }
+    return result;
+  }
+
   // Last committed checkpoint of a resource, or null when none was ever
   // written. Purely a lookup: the clock is never read and nothing is
   // reconciled, purged or counted. The returned record is a fresh object.
@@ -3238,6 +3394,7 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     epoch,
     assertLease,
     writeCheckpoint,
+    writeCheckpointAll,
     readCheckpoint,
     stats,
     cancel,
@@ -4209,6 +4366,66 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
           version: event.version,
           epoch: event.epoch,
         });
+        break;
+      }
+      case 'checkpoint-all': {
+        // A batch checkpoint commit is one indivisible record: every item is
+        // validated and its version checked before any of them is applied,
+        // so a complete but damaged record is refused wholesale instead of
+        // recovering half a batch. The record's own sequence id makes a
+        // folded batch (snapshot already contains its checkpoints) skip
+        // exactly once, so no version can ever be advanced twice.
+        if (!Array.isArray(event.items) || event.items.length === 0) {
+          throw new LogFileError(
+            `corrupt checkpoint-all entry on line ${lineNumber} of ${logPath}`,
+          );
+        }
+        const seen = new Set();
+        for (const item of event.items) {
+          if (
+            item === null ||
+            typeof item !== 'object' ||
+            typeof item.resource !== 'string' ||
+            item.resource === '' ||
+            !Number.isSafeInteger(item.height) ||
+            item.height < 0 ||
+            typeof item.hash !== 'string' ||
+            item.hash === '' ||
+            !Number.isSafeInteger(item.version) ||
+            item.version <= 0 ||
+            !Number.isSafeInteger(item.epoch) ||
+            item.epoch <= 0
+          ) {
+            throw new LogFileError(
+              `corrupt checkpoint-all entry on line ${lineNumber} of ${logPath}`,
+            );
+          }
+          if (seen.has(item.resource)) {
+            throw new LogFileError(
+              `duplicate resource in checkpoint-all entry on line ${lineNumber} of ${logPath}`,
+            );
+          }
+          seen.add(item.resource);
+          // The whole record committed at once and its resources are
+          // pairwise distinct, so each logged version must be exactly one
+          // past the version recovered so far: a gap, a repeat or a smaller
+          // value means the history is damaged.
+          const existing = checkpoints.get(item.resource);
+          const expectedVersion = (existing === undefined ? 0 : existing.version) + 1;
+          if (item.version !== expectedVersion) {
+            throw new LogFileError(
+              `non-monotonic checkpoint version on line ${lineNumber} of ${logPath}`,
+            );
+          }
+        }
+        for (const item of event.items) {
+          checkpoints.set(item.resource, {
+            height: item.height,
+            hash: item.hash,
+            version: item.version,
+            epoch: item.epoch,
+          });
+        }
         break;
       }
       case 'reclaim': {
