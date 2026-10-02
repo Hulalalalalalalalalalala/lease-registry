@@ -1620,11 +1620,12 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     return true;
   }
 
-  // Validate one batch-renew argument: a non-empty array whose elements are
-  // pairwise distinct, non-empty strings. Shape errors are TypeErrors and are
-  // raised before the clock is read or any token is looked up, so a malformed
-  // call never depends on which credentials currently exist.
-  function validateRenewTokens(tokens) {
+  // Validate one token-list argument: a non-empty array whose elements are
+  // pairwise distinct, non-empty strings with no empty slots. Shared by the
+  // batch heartbeat and the group handover. Shape errors are TypeErrors and
+  // are raised before the clock is read or any token is looked up, so a
+  // malformed call never depends on which credentials currently exist.
+  function validateTokenList(tokens) {
     if (!Array.isArray(tokens) || tokens.length === 0) {
       throw new TypeError('tokens must be a non-empty array');
     }
@@ -1645,7 +1646,7 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
   // from different batches and holders, including different shares of one
   // shared resource; no current epoch is required.
   function renewAll(tokens) {
-    validateRenewTokens(tokens);
+    validateTokenList(tokens);
 
     // Exactly one injected reading for the whole batch; a non-finite reading
     // is a caller (clock) error, never a silent false.
@@ -1853,6 +1854,164 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     }
     pushLeaseHeaps(minted.token, nextLease);
     return { resource, holder, token: minted.token, expiresAt, epoch: nextEpoch };
+  }
+
+  // Atomically hand a whole set of live exclusive credentials to one holder
+  // in a single commit: either every named resource changes hands or none of
+  // them does. The tokens may come from different holders and different
+  // batches and may name the holder they already have; each resource still
+  // consumes exactly one epoch and receives one brand-new credential, all
+  // expiring at one shared deadline (the single clock reading plus the chosen
+  // ttl). Like a single transfer the group handover moves no share and none
+  // of the four counters, so it can never free room or wake a waiter, and
+  // other credentials of the involved atomic groups stay untouched.
+  function transferAll(tokens, holder, ttlMs = undefined) {
+    // Shape first, before any credential lookup or clock read: a malformed
+    // call fails identically regardless of which credentials currently
+    // exist.
+    validateTokenList(tokens);
+    if (typeof holder !== 'string' || holder === '') {
+      throw new TypeError('holder must be a non-empty string');
+    }
+    const effectiveTtl = ttlMs === undefined ? defaultTtlMs : ttlMs;
+    if (!Number.isFinite(effectiveTtl) || effectiveTtl <= 0) {
+      throw new TypeError('ttlMs must be a positive finite number');
+    }
+
+    // Exactly one injected reading for the whole group.
+    const now = clock();
+    if (!Number.isFinite(now)) {
+      throw new TypeError('clock reading must be a finite number');
+    }
+    const expiresAt = now + effectiveTtl;
+    if (!Number.isFinite(expiresAt)) {
+      throw new TypeError('transfer expiry must be a finite number');
+    }
+
+    // Judge the whole group before anything moves. Every token must name a
+    // credential minted by this instance (unknown, other-instance,
+    // pre-restart, released, reclaimed and transfer-replaced tokens are all
+    // absent from the table or legacy), belong to an undeclared exclusive
+    // resource, carry that resource's latest epoch, and be live at this
+    // reading (`expiresAt > now`, including when the reading went
+    // backwards). A declared resource fences even when its capacity is one.
+    // The tokens are pairwise distinct, so two current exclusive
+    // credentials can never name the same resource.
+    const entries = [];
+    for (const token of tokens) {
+      const lease = leases.get(token);
+      if (lease === undefined || lease.legacy) {
+        throw new LeaseFencedError(lease === undefined ? null : lease.resource);
+      }
+      const { resource } = lease;
+      const rs = resourceStates.get(resource);
+      if (
+        rs === undefined ||
+        rs.declared ||
+        epochs.get(resource) !== lease.epoch
+      ) {
+        throw new LeaseFencedError(resource);
+      }
+      if (lease.expiresAt <= now) {
+        throw new LeaseFencedError(resource);
+      }
+      entries.push({ token, lease, resource, rs });
+    }
+
+    // Reserve every new epoch and mint every new token up front; nothing is
+    // committed until the event is on disk.
+    const items = [];
+    let seq = tokenSequence;
+    const epochCursor = new Map();
+    for (const entry of entries) {
+      const nextEpoch = (epochCursor.get(entry.resource)
+        ?? epochs.get(entry.resource) ?? 0) + 1;
+      epochCursor.set(entry.resource, nextEpoch);
+      const minted = mintToken(now, seq);
+      seq = minted.seq;
+      entry.nextToken = minted.token;
+      entry.nextSeq = minted.seq;
+      entry.nextEpoch = nextEpoch;
+      items.push({
+        from: entry.token,
+        token: minted.token,
+        resource: entry.resource,
+        epoch: nextEpoch,
+      });
+    }
+
+    // Bring every owner of every share to the passed reading before the
+    // commit, exactly like a single transfer and a batch heartbeat: a
+    // reading that moved backwards may have revived a share an earlier
+    // reading retired, and the fresh expiry nodes have to land on the same
+    // owner state the liveness judgment used. Owners repeat across the
+    // group (tokens are distinct, but chains converge), so each is
+    // reconciled once. The reconciliation is lazy observation, not a
+    // committed movement; a failed append below therefore needs no undo.
+    const owners = new Set();
+    for (const { rs, lease } of entries) {
+      owners.add(rs);
+      for (const quota of lease.chain) {
+        owners.add(quota);
+      }
+    }
+    for (const owner of owners) {
+      reconcile(owner, now);
+    }
+
+    // One indivisible record for the whole handover: the append either
+    // lands with every old/new credential pair in it or throws
+    // LogFileError having changed nothing durable.
+    appendEvent({
+      v: LOG_VERSION,
+      type: 'transfer-all',
+      at: now,
+      holder,
+      ttlMs: effectiveTtl,
+      expiresAt,
+      items,
+    });
+
+    // The write landed: swap every credential in input order. Occupancy is
+    // constant at every owner level - one live share comes out and one goes
+    // back in - and the old expiry nodes retire lazily exactly like a single
+    // transfer's.
+    tokenSequence = seq;
+    const result = [];
+    for (const entry of entries) {
+      const { lease, resource, rs } = entry;
+      knownTokens.add(entry.nextToken);
+      retirePermanent(lease);
+      leases.delete(entry.token);
+      removeSlot(resource, entry.token);
+      const nextLease = {
+        resource,
+        holder,
+        expiresAt,
+        ttlMs: effectiveTtl,
+        legacy: false,
+        heapSeq: 0,
+        batch: null,
+        epoch: entry.nextEpoch,
+        chain: lease.chain,
+      };
+      leases.set(entry.nextToken, nextLease);
+      epochs.set(resource, entry.nextEpoch);
+      addSlot(resource, entry.nextToken);
+      rs.live += 1;
+      for (const quota of lease.chain) {
+        quota.live += 1;
+      }
+      pushLeaseHeaps(entry.nextToken, nextLease);
+      result.push({
+        resource,
+        holder,
+        token: entry.nextToken,
+        expiresAt,
+        epoch: entry.nextEpoch,
+      });
+    }
+    return result;
   }
 
   // Cancelling only lands on a request that is still queued: an already
@@ -2717,6 +2876,7 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
     renewAll,
     release,
     transfer,
+    transferAll,
     sweep,
     holder,
     epoch,
@@ -3438,6 +3598,126 @@ export function createRegistry({ ttlMs, clock = Date.now, logPath = null } = {})
           quota.live += 1;
         }
         pushLeaseHeaps(event.token, lease);
+        break;
+      }
+      case 'transfer-all': {
+        // A group handover is one indivisible record: every item is
+        // validated and its epoch checked before any credential is
+        // replaced, so a complete but damaged line is refused wholesale
+        // instead of recovering half a group. The record's own sequence id
+        // makes a folded group (already inside a snapshot) skip exactly
+        // once, so it can never be applied twice.
+        if (
+          typeof event.holder !== 'string' ||
+          event.holder === '' ||
+          !Number.isFinite(event.ttlMs) ||
+          !Number.isFinite(event.expiresAt) ||
+          !Array.isArray(event.items) ||
+          event.items.length === 0
+        ) {
+          throw new LogFileError(
+            `corrupt transfer-all entry on line ${lineNumber} of ${logPath}`,
+          );
+        }
+        const moves = [];
+        const seenFrom = new Set();
+        const seenToken = new Set();
+        const seenResource = new Set();
+        for (const item of event.items) {
+          if (
+            item === null ||
+            typeof item !== 'object' ||
+            typeof item.from !== 'string' ||
+            item.from === '' ||
+            typeof item.token !== 'string' ||
+            item.token === '' ||
+            item.resource === null || item.resource === undefined ||
+            !Number.isInteger(item.epoch) || item.epoch <= 0
+          ) {
+            throw new LogFileError(
+              `corrupt transfer-all entry on line ${lineNumber} of ${logPath}`,
+            );
+          }
+          if (seenFrom.has(item.from) || seenToken.has(item.token)) {
+            throw new LogFileError(
+              `duplicate credential in transfer-all entry on line ${lineNumber} of ${logPath}`,
+            );
+          }
+          seenFrom.add(item.from);
+          seenToken.add(item.token);
+          if (seenToken.has(item.from) || seenFrom.has(item.token)) {
+            throw new LogFileError(
+              `credential reused within a transfer-all entry on line ${lineNumber} of ${logPath}`,
+            );
+          }
+          if (seenResource.has(item.resource)) {
+            throw new LogFileError(
+              `duplicate resource in transfer-all entry on line ${lineNumber} of ${logPath}`,
+            );
+          }
+          seenResource.add(item.resource);
+          // Every item consumes exactly one epoch of its resource, and the
+          // whole record committed at once, so each logged epoch must be
+          // exactly one past the recovered epoch as the items are applied.
+          const expectedEpoch = (epochs.get(item.resource) ?? 0) + 1;
+          if (item.epoch !== expectedEpoch) {
+            throw new LogFileError(
+              `non-monotonic lease epoch on line ${lineNumber} of ${logPath}`,
+            );
+          }
+          // As with renew-all, a committed group only named credentials
+          // granted earlier in the same log (or present in the snapshot a
+          // folded group rode in with); a missing old credential means the
+          // history can no longer reconstruct the group atomically.
+          if (leases.get(item.from) === undefined) {
+            throw new LogFileError(
+              `transfer-all entry for unknown token on line ${lineNumber} of ${logPath}`,
+            );
+          }
+          moves.push(item);
+        }
+        replayBatchId = null;
+        replayBatchTokens = new Set();
+        for (const item of moves) {
+          // Structural handover, item by item, exactly as the in-process
+          // group commit did: the old credential vacates its slot and the
+          // table without any counter movement, the fresh one takes its
+          // place at the shared deadline carrying the next epoch.
+          const oldLease = leases.get(item.from);
+          const oldRs = resourceStates.get(oldLease.resource);
+          removeHeapNodes(oldRs.heap, item.from);
+          for (const q of oldLease.chain) {
+            removeHeapNodes(q.heap, item.from);
+          }
+          retirePermanent(oldLease);
+          leases.delete(item.from);
+          removeSlot(oldLease.resource, item.from);
+
+          const rs = resourceStateFor(item.resource);
+          const lease = {
+            resource: item.resource,
+            holder: event.holder,
+            expiresAt: event.expiresAt,
+            ttlMs: event.ttlMs,
+            // Credentials issued before this process started are void: the
+            // lease keeps occupying its resource, but its token cannot
+            // renew, release or hand it over.
+            legacy: true,
+            heapSeq: 0,
+            epoch: item.epoch,
+            batch: null,
+            chain: rs.chain,
+          };
+          leases.set(item.token, lease);
+          addSlot(item.resource, item.token);
+          knownTokens.add(item.token);
+          epochs.set(item.resource, item.epoch);
+          rs.live += 1;
+          for (const quota of rs.chain) {
+            quota.live += 1;
+          }
+          pushLeaseHeaps(item.token, lease);
+        }
         break;
       }
       case 'reclaim': {

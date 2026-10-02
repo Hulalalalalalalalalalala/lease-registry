@@ -34,6 +34,10 @@ Node.js 20 or newer. No runtime dependencies.
   { resource, holder, token, expiresAt, epoch }` hands a live exclusive
   credential straight to a new holder without a free gap; see "Holder
   transfer" below.
+- `Registry.transferAll(tokens, holder, ttlMs = undefined) ->
+  [{ resource, holder, token, expiresAt, epoch }, ...]` atomically hands a
+  whole set of exclusive credentials to one holder in a single commit; see
+  "Group handover" below.
 - `Registry.sweep(now) -> string[]` reclaims expired leases and names the resources it freed, ordered by expiry time.
 - `Registry.holder(resource) -> string | null` reports the current holder.
 - `Registry.epoch(resource) -> number` reports the resource's last committed
@@ -143,6 +147,68 @@ back: the old credential can still renew, release and pass the fence, no
 new token exists, and the epoch and counters never moved. Replay and
 compaction preserve the old/new credential relationship exactly; both
 credentials are void after a restart, as with every recovered credential.
+
+### Group handover
+
+`Registry.transferAll(tokens, holder, ttlMs = undefined) ->
+[{ resource, holder, token, expiresAt, epoch }, ...]` hands a whole set of
+exclusive resources to one holder atomically: either every named resource
+changes hands or none of them does. `tokens` must be a non-empty array of
+pairwise distinct, non-empty strings with no empty slots, and `holder` must
+be a non-empty string. The credentials may come from different holders and
+different batches, and a resource may already belong to the target holder.
+A non-array, an empty array, an empty slot, a non-string or empty element, a
+repeated token, a non-string or empty `holder`, or a non-positive,
+non-finite `ttlMs` throws `TypeError`; the whole shape is validated before
+any credential is looked up or the clock is read, so the same malformed
+call throws regardless of which credentials currently exist.
+
+After the arguments pass validation the injected clock is read exactly
+once; a non-finite reading throws `TypeError`. Every credential must then
+be minted by this instance, still present in the table, live at that
+reading (`expiresAt > now`, so a reading that moved backwards simply judges
+the group against the earlier instant), belong to an undeclared exclusive
+resource, and carry that resource's latest epoch. An unknown token, a
+credential from another instance or from before a restart, one that was
+released, reclaimed, replaced by an earlier transfer or has already
+expired, or a credential of a declared share resource — even one whose
+capacity is one — makes the whole call throw `LeaseFencedError`
+(`LEASE_FENCED`); removed credentials never revive.
+
+Only when every member survives are the new credentials planned: each
+resource's epoch advances by exactly one, every new token is fresh and
+pairwise distinct, and every new credential shares the single deadline
+given by the one clock reading plus the chosen TTL (the registry default
+when `ttlMs` is omitted); a non-finite resulting deadline throws
+`TypeError`. On success the call returns one entry per input token, in
+input order, using the same shape as `transfer`. Afterwards every old
+token behaves like a released one — `renew` and `release` return `false`
+and the fence throws — while the new credentials can themselves be
+renewed, released, handed over singly with `transfer` or handed over again
+with `transferAll`.
+
+The handover moves no share: occupancy at every resource and quota level is
+identical before and after, so it never frees capacity or quota room and
+never wakes a waiter. Waiting requests, queue positions and ticket states
+— including tickets already past their deadline — are neither purged,
+woken nor otherwise touched. None of the four cumulative counters moves,
+and a failed call changes no lease, epoch, counter, wait ticket or log
+line. `exportState` then presents the whole group result at once and
+`checkConsistency` reports `ok: true`.
+
+When `logPath` is set the entire group is appended as one indivisible
+`transfer-all` record carrying the shared `at`, `holder`, `ttlMs` and
+`expiresAt` and one `{ from, token, resource, epoch }` item per input
+token. If the append fails the call throws `LogFileError`
+(`LOG_FILE_ERROR`) and rolls fully back: every old credential stays usable
+and retryable, no new token exists, and epochs and counters never moved.
+Across a restart or compaction every new holder, the shared expiry and
+every new epoch are restored exactly once — the group can never come back
+half applied or be applied twice — and both old and new credentials are
+void after a restart, as with every recovered credential. An unfinished
+record at the log tail is ignored in its entirety, while a complete but
+structurally damaged group record throws `LogFileError`. Logs and
+snapshots written by older versions stay readable.
 
 ### Batch renewal
 
@@ -258,9 +324,10 @@ write as the release or reclaim that triggered it), so queued requests do
 not survive a restart.
 
 When `logPath` points at a file, every grant, renewal (single or atomic
-batch), early release, holder transfer and
-reclaim is appended to it as one JSON line; each acquire (and transfer) line carries the
-credential epoch atomically with the grant. On startup the history is replayed
+batch), early release, holder transfer (single or atomic group) and
+reclaim is appended to it as one JSON line; each acquire, transfer and
+transfer-all line carries the credential epoch(s) atomically with the
+grant. On startup the history is replayed
 in order, so unexpired leases keep occupying their resources, the four
 cumulative counters come back exactly as they were, and every resource's
 last committed epoch comes back exactly as it stood; replay itself adds no
